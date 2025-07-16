@@ -1,1 +1,48 @@
-# ACG-repo
+secure_chat_app/
+│
+├── client/
+│   ├── client.py              # Main client app (sends/receives messages, login GUI)
+│   ├── encryption_utils.py    # Encryption logic: AES, RSA, key generation, hashing
+│   ├── file_transfer.py       # Logic for encrypting/decrypting and sending images/files
+│   ├── gui.py                 # Optional GUI interface 
+│   └── keys/
+│       ├── user_private.pem   # User's encrypted private RSA key
+│       └── user_public.pem    # User's public RSA key
+│
+├── server/
+│   ├── server.py              # Main server: handles user auth, message relaying
+│   ├── db/
+│   │   └── user_db.sqlite     # SQLite DB for storing user credentials (hashed)
+│   └── keys/
+│       ├── server_private.pem # Optional: for server-authenticated encryption/signatures
+│       └── server_public.pem
+│
+├── deployment/
+│   ├── group_keys/            # (Optional) Shared group keys if group chat is supported
+│   └── shared_files/          # Stores uploaded encrypted images/files temporarily
+│
+├── docs/
+│   ├── proposal_report.docx   # Your 10-page report for submission
+│   ├── contributions.txt      # Who did what 
+│   └── references.bib         # Citations/references if needed
+│
+├── requirements.txt           # List of dependencies (PyCryptodome, Flask, etc.)
+└── README.md                  # GitHub-style documentation
+
+Use these commands nerds:
+Check database for users:
+        sqlite3 ../server/db/user_db.sqlite
+        .tables
+        SELECT username FROM users;
+        SELECT * FROM users WHERE username='alice';
+
+Del all users from database (in D:\ACG 25\CA2\ACG-repo\client>)
+        del ..\server\db\user_db.sqlite (deletes whole user_db.sqlite file, its created again upon running client.py again use this only for testing reasons)
+
+Installation:
+        pip3 install pycryptdome
+        pip3 install tk
+        pip3 install flask
+
+Jingkai's update:
+I implemented a user registration system with RSA key generation and password hashing. Usernames are checked against an SQLite database to prevent duplicates, and passwords are hashed using PBKDF2 with a random salt. A 2048-bit RSA key pair is generated, with the private key encrypted using AES and saved locally. Public keys are stored in the database. The flow make sure keys are only created after validation, and a decryption test confirms successful encryption and key handling.
