@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from getpass import getpass
-from encryption_utils import generate_rsa_keypair, encrypt_private_key, save_key_to_file
+from encryption_utils import generate_dh_keypair, export_key, encrypt_private_key, save_key_to_file
 
 DB_PATH = '../server/db/user_db.sqlite'
 KEY_DIR = './keys/'
@@ -29,21 +29,23 @@ def register_user():
         return
 
     # Only generate keys after DB check passes 
-    priv_key, pub_key = generate_rsa_keypair()
+    priv_key, pub_key = generate_dh_keypair()
+    priv_key_pem = export_key(priv_key).encode()
+    pub_key_pem = export_key(pub_key).encode()
 
     # Encrypt private key with password
-    encrypted_priv_key = encrypt_private_key(priv_key, password.encode())
+    encrypted_priv_key = encrypt_private_key(priv_key_pem, password.encode())
 
-    # Save the keys locally
+    # Save the keys
     os.makedirs(KEY_DIR, exist_ok=True)
-    save_key_to_file(KEY_DIR + f'{username}_public.pem', pub_key)
+    save_key_to_file(KEY_DIR + f'{username}_public.pem', pub_key_pem)
     save_key_to_file(KEY_DIR + f'{username}_private.enc', encrypted_priv_key)
 
     # Hash password and store with public key
     salt = os.urandom(16)
     pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
 
-    c.execute("INSERT INTO users VALUES (?, ?, ?, ?)", (username, salt, pwd_hash, pub_key))
+    c.execute("INSERT INTO users VALUES (?, ?, ?, ?)", (username, salt, pwd_hash, pub_key_pem))
     conn.commit()
     conn.close()
 
