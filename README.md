@@ -40,7 +40,7 @@ Del all users from database (in D:\ACG 25\CA2\ACG-repo\client>)
         del ..\server\db\user_db.sqlite (deletes whole user_db.sqlite file, its created again upon running client.py again use this only for testing reasons)
 
 Installation:
-        pip3 install pycryptdome
+        pip3 install pycryptodome
         pip3 install tk
         pip3 install flask
 
@@ -50,3 +50,15 @@ Implemented a user registration system with X25519 Diffie-Hellman key generation
 
 Xu Kai's update:
 Following Jing Kai's work, I also finished coding up the login and also the message encryption part, encryption use eccdh like we planned. So after me, whoever can do message decryption, encrypt and decrypt images and also digital signature 
+
+Jerome
+Message Decryption has been put into fil_transfer.py
+For message decryption, two requirements are the receipient's private key and the sender's public key.
+typically 64 bytes
+nonce = enc_data[:16] "first 16 bytes"
+tag = enc_data[16:32] "next 16 bytes"
+ciphertext = enc_data[32:] "rest of the bytes"
+It:
+Accepts the recipient's private key, sender's public key, and the base64-encoded nonce, tag, and ciphertext.
+Derives the shared AES key using ECDH.
+Decodes and concatenates the encrypted components.

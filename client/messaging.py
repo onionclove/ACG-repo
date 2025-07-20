@@ -3,6 +3,7 @@ from Crypto.PublicKey import RSA
 from Crypto.Random import get_random_bytes
 import base64
 import sqlite3
+DB_PATH = '../server/db/user_db.sqlite'
 
 def send_encrypted_message(recipient_username, plaintext_msg):
     # === Load recipient's public key from DB ===
