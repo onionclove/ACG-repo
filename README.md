@@ -62,3 +62,7 @@ It:
 Accepts the recipient's private key, sender's public key, and the base64-encoded nonce, tag, and ciphertext.
 Derives the shared AES key using ECDH.
 Decodes and concatenates the encrypted components.
+
+Craig
+Inplemented Image encryption and decryption in encrypt_image.py and decrypt_image.py.
+2 requirements are receiver private key and sender public key for decryption and receiver public key and sender private key for encryption. Use by running python encrypt_image or python decrypt_image for either encryption or decryption of image.
