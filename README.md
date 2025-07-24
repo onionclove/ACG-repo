@@ -44,6 +44,25 @@ Installation:
         pip3 install tk
         pip3 install flask
 
+Testing Encryption (in terminal):
+        cd client (cd into client first)
+        python client.py (to choose between registration and login)
+        register name and password
+        login with name and password
+        given prompt to send message to, enter name you want to send to
+        then enter the message
+
+Testing Decryption (in terminal):
+        cd client (cd into client first)
+        python decrypt_messaging.py
+        prompted for Recipient's username
+        prompted for Sender's username
+        prompted for Recipient's password
+        prompted for Nonce (base64)
+        prompted for Tag (base64)
+        prompted for Ciphertext (base64)
+        Decrypted message will then be displayed
+
 Jingkai's update:
 I implemented a user registration system with RSA key generation and password hashing. Usernames are checked against an SQLite database to prevent duplicates, and passwords are hashed using PBKDF2 with a random salt. A 2048-bit RSA key pair is generated, with the private key encrypted using AES and saved locally. Public keys are stored in the database. The flow make sure keys are only created after validation, and a decryption test confirms successful encryption and key handling.
 Implemented a user registration system with X25519 Diffie-Hellman key generation and password hashing. Usernames are checked against an SQLite database to prevent duplicates. Private keys are encrypted using AES and stored locally, with public keys stored in the DB. The system ensures keys are only generated after validation, and includes decryption tests for verification.
