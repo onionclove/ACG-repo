@@ -6,6 +6,7 @@ from Crypto.Protocol.KDF import PBKDF2
 from Crypto.Random import get_random_bytes
 import os
 import base64
+from Crypto.Signature import eddsa
 
 # DH Key Functions
 
@@ -100,3 +101,19 @@ def decrypt_ecc_message(recipient_priv_key, sender_pub_key, nonce_b64, tag_b64, 
     # Decrypt
     plaintext = decrypt_message(enc_data, aes_key)
     return plaintext.decode()
+
+
+
+def sign_blob(signing_private_pem: bytes, data: bytes) -> bytes:
+    key = ECC.import_key(signing_private_pem)
+    signer = eddsa.new(key, mode='rfc8032')
+    return signer.sign(data)  # 64-byte signature
+
+def verify_blob(signing_public_pem: bytes, data: bytes, signature: bytes) -> bool:
+    key = ECC.import_key(signing_public_pem)
+    verifier = eddsa.new(key, mode='rfc8032')
+    try:
+        verifier.verify(data, signature)
+        return True
+    except ValueError:
+        return False

@@ -1,34 +1,113 @@
-import base64
-from encryption_utils import load_key_from_file, decrypt_ecc_message
+import os
+from getpass import getpass
+from encryption_utils import (
+    import_key,
+    decrypt_private_key,
+    load_key_from_file,
+    verify_blob,
+)
+from Crypto.PublicKey import ECC
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA256
+import sqlite3
 
-def main():
-    import os
-    # Prompt for usernames
-    recipient_username = input("Recipient username: ")
-    sender_username = input("Sender username: ")
+DB_PATH = '../server/db/user_db.sqlite'  # adjust if needed
 
-    # Use paths relative to this script's location
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    priv_key_path = os.path.join(BASE_DIR, "keys", f"{recipient_username}_private.enc")
-    pub_key_path = os.path.join(BASE_DIR, "keys", f"{sender_username}_public.pem")
+def decrypt_image_from_logged_in():
+    print("=== ECC Image Decryption with Signature Verification ===")
 
-    # Load recipient's private key (encrypted PEM)
-    password = input(f"Password for {recipient_username}: ")
-    from encryption_utils import decrypt_private_key
-    encrypted_priv = load_key_from_file(priv_key_path)
-    recipient_priv_pem = decrypt_private_key(encrypted_priv, password.encode()).decode()
+    # === Step 1: Get paths and password ===
+    priv_key_path = input("Enter path to your encrypted private key (.enc): ").strip()
+    password = getpass("Enter your password: ").strip()
+    sender_pub_key_path = input("Enter path to sender's exchange public key (.pem): ").strip()
+    encrypted_image_path = input("Enter path to encrypted+signed image file: ").strip()
+    output_path = input("Enter output filename (e.g., decrypted.jpg): ").strip()
+    sender_username = input("Enter sender's username (for signature key lookup): ").strip()
 
-    # Load sender's public key
-    sender_pub_pem = load_key_from_file(pub_key_path).decode()
+    # === Step 2: Decrypt your exchange private key ===
+    try:
+        encrypted_key = load_key_from_file(priv_key_path)
+        decrypted_key = decrypt_private_key(encrypted_key, password.encode())
+        recipient_priv_key = ECC.import_key(decrypted_key)
+    except Exception as e:
+        print("❌ Failed to decrypt your exchange private key:", e)
+        return
 
-    # Prompt for message parts
-    nonce_b64 = input("Nonce (base64): ")
-    tag_b64 = input("Tag (base64): ")
-    ciphertext_b64 = input("Ciphertext (base64): ")
+    # === Step 3: Load sender's exchange public key ===
+    try:
+        with open(sender_pub_key_path, 'rt') as f:
+            sender_exchange_pub = ECC.import_key(f.read())
+    except Exception as e:
+        print("❌ Failed to load sender's exchange public key:", e)
+        return
 
-    # Decrypt
-    decrypted = decrypt_ecc_message(recipient_priv_pem, sender_pub_pem, nonce_b64, tag_b64, ciphertext_b64)
-    print("Decrypted message:", decrypted)
+    # === Step 4: Read encrypted+signed file ===
+    if not os.path.exists(encrypted_image_path):
+        print("❌ Encrypted image not found:", encrypted_image_path)
+        return
+
+    try:
+        data = open(encrypted_image_path, 'rb').read()
+        if len(data) < 16 + 16 + 64:
+            print("❌ File too short to contain nonce, tag, ciphertext, and signature.")
+            return
+
+        nonce = data[:16]
+        tag = data[16:32]
+        signature = data[-64:]
+        ciphertext = data[32:-64]
+    except Exception as e:
+        print("❌ Failed to parse encrypted file:", e)
+        return
+
+    # === Step 5: Load sender's signing public key from DB ===
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT signing_public_key FROM users WHERE username = ?", (sender_username,))
+        row = c.fetchone()
+        conn.close()
+        if not row or row[0] is None:
+            print("❌ Sender's signing public key missing in DB.")
+            return
+        signing_pub_pem = row[0]
+        if isinstance(signing_pub_pem, memoryview):
+            signing_pub_pem = signing_pub_pem.tobytes()
+    except Exception as e:
+        print("❌ Failed to fetch signing public key from DB:", e)
+        return
+
+    # === Step 6: Verify signature ===
+    to_verify = nonce + tag + ciphertext
+    try:
+        if not verify_blob(signing_pub_pem, to_verify, signature):
+            print("❌ Signature invalid. Aborting decryption.")
+            return
+    except Exception as e:
+        print("❌ Error during signature verification:", e)
+        return
+
+    print("[+] Signature verified.")
+
+    # === Step 7: Derive shared AES key ===
+    try:
+        shared_point = sender_exchange_pub.pointQ * recipient_priv_key.d
+        shared_secret = int(shared_point.x).to_bytes(32, 'big')
+        aes_key = SHA256.new(shared_secret).digest()
+    except Exception as e:
+        print("❌ Failed to derive shared key:", e)
+        return
+
+    # === Step 8: Decrypt image ===
+    try:
+        cipher = AES.new(aes_key, AES.MODE_EAX, nonce=nonce)
+        plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+        with open(output_path, 'wb') as f:
+            f.write(plaintext)
+        print(f"[+] Decrypted image saved to: {output_path}")
+    except Exception as e:
+        print("❌ Decryption/authentication failed after signature verification:", e)
+
 
 if __name__ == "__main__":
-    main()
+    decrypt_image_from_logged_in()

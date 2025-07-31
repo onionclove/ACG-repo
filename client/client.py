@@ -12,14 +12,15 @@ def register_user():
 
     import hashlib
 
-    # Open DB and check user BED type shyt
+    # Open DB and ensure table has signing_public_key column
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (
                  username TEXT PRIMARY KEY,
                  salt BLOB,
                  hash BLOB,
-                 public_key BLOB)''')
+                 public_key BLOB,
+                 signing_public_key BLOB)''')
 
     # Check if user already exists
     c.execute("SELECT * FROM users WHERE username = ?", (username,))
@@ -28,30 +29,46 @@ def register_user():
         conn.close()
         return
 
-    # Only generate keys after DB check passes 
+    # === EXISTING: X25519 (exchange) keypair ===
     priv_key, pub_key = generate_dh_keypair()
     priv_key_pem = export_key(priv_key).encode()
     pub_key_pem = export_key(pub_key).encode()
 
-    # Encrypt private key with password
+    # Encrypt exchange private key with password
     encrypted_priv_key = encrypt_private_key(priv_key_pem, password.encode())
+
+    # === NEW: Ed25519 signing keypair ===
+    from Crypto.PublicKey import ECC
+    from encryption_utils import encrypt_private_key as _encrypt_private_key  # reuse your function
+    sign_priv = ECC.generate(curve='Ed25519')
+    sign_pub = sign_priv.public_key()
+
+    sign_priv_pem = sign_priv.export_key(format='PEM').encode()
+    sign_pub_pem = sign_pub.export_key(format='PEM').encode()
+
+    encrypted_sign_priv = encrypt_private_key(sign_priv_pem, password.encode())
 
     # Save the keys
     os.makedirs(KEY_DIR, exist_ok=True)
     save_key_to_file(KEY_DIR + f'{username}_public.pem', pub_key_pem)
     save_key_to_file(KEY_DIR + f'{username}_private.enc', encrypted_priv_key)
+    save_key_to_file(KEY_DIR + f'{username}_signing_private.enc', encrypted_sign_priv)
 
-    # Hash password and store with public key
+    # Hash password and store with public keys
     salt = os.urandom(16)
     pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
 
-    c.execute("INSERT INTO users VALUES (?, ?, ?, ?)", (username, salt, pwd_hash, pub_key_pem))
+    # Insert with explicit columns including signing public key
+    c.execute(
+        "INSERT INTO users (username, salt, hash, public_key, signing_public_key) VALUES (?, ?, ?, ?, ?)",
+        (username, salt, pwd_hash, pub_key_pem, sign_pub_pem)
+    )
     conn.commit()
     conn.close()
 
     print("Registered successfully! :))")
 
-    # === STEP 3: TEST DECRYPTION ===
+    # === DEBUG: test decryption (remove in production) ===
     from encryption_utils import decrypt_private_key, load_key_from_file
     enc_key = load_key_from_file(KEY_DIR + f'{username}_private.enc')
     decrypted = decrypt_private_key(enc_key, password.encode())
@@ -111,21 +128,20 @@ def login_user():
         return None, None, None
 
 def send_encrypted_message(sender_username, password, recipient_username, message):
-    from encryption_utils import decrypt_private_key, load_key_from_file
+    from encryption_utils import decrypt_private_key, load_key_from_file, sign_blob
     from Crypto.Cipher import AES
     from Crypto.Hash import SHA256
     from Crypto.PublicKey import ECC
-    from Crypto.Random import get_random_bytes
     import base64
     import sqlite3
 
-    # === Load sender's encrypted private key ===
+    # === Load sender's encrypted exchange private key ===
     priv_key_path = f"./keys/{sender_username}_private.enc"
     encrypted_priv = load_key_from_file(priv_key_path)
     priv_key_pem = decrypt_private_key(encrypted_priv, password.encode())
     sender_priv_key = ECC.import_key(priv_key_pem)
 
-    # === Load recipient's public key from DB ===
+    # === Load recipient's exchange public key from DB ===
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT public_key FROM users WHERE username = ?", (recipient_username,))
@@ -151,12 +167,25 @@ def send_encrypted_message(sender_username, password, recipient_username, messag
     # === Encrypt the message ===
     cipher = AES.new(aes_key, AES.MODE_EAX)
     ciphertext, tag = cipher.encrypt_and_digest(message.encode())
+    nonce = cipher.nonce
+
+    # === SIGN the encrypted bundle ===
+    # Build blob: nonce || tag || ciphertext
+    to_sign = nonce + tag + ciphertext
+
+    # Load & decrypt sender's signing private key
+    signing_priv_enc = load_key_from_file(f"./keys/{sender_username}_signing_private.enc")
+    signing_priv_pem = decrypt_private_key(signing_priv_enc, password.encode())
+
+    signature = sign_blob(signing_priv_pem, to_sign)
 
     # === Print values to simulate sending ===
-    print("\nEncrypted ECC message:")
-    print("Nonce:", base64.b64encode(cipher.nonce).decode())
+    print("\nEncrypted ECC message with signature:")
+    print("Nonce:", base64.b64encode(nonce).decode())
     print("Tag:", base64.b64encode(tag).decode())
     print("Ciphertext:", base64.b64encode(ciphertext).decode())
+    print("Signature:", base64.b64encode(signature).decode())
+
 
 if __name__ == "__main__":
     choice = input("Type 'r' to register, 'l' to login: ").lower()

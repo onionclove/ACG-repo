@@ -85,3 +85,12 @@ Decodes and concatenates the encrypted components.
 Craig
 Inplemented Image encryption and decryption in encrypt_image.py and decrypt_image.py.
 2 requirements are receiver private key and sender public key for decryption and receiver public key and sender private key for encryption. Use by running python encrypt_image or python decrypt_image for either encryption or decryption of image.
+
+
+
+
+Jotish: Implemented end-to-end message and image authentication via digital signatures. Extended the existing key system by adding an Ed25519 signing keypair per user (private key encrypted with user password, public key stored in the user database) alongside the existing X25519/ECC key agreement keys. Modified the send and receive flows 
+To:
+Sign the encrypted payload (nonce || tag || ciphertext) with the sender’s Ed25519 private key, producing a signature that is transmitted/appended.
+Verify that signature on the recipient side using the sender’s signing public key before attempting decryption.
+This ensures the recipient can trust who sent the message or image and that it wasn’t altered in transit, while preserving confidentiality through the existing ECDH+AES encryption. Added safe fallback logic for key material types, handled blob construction correctly, and enforced abort-on-signature-failure to prevent tampered data from being processed.
