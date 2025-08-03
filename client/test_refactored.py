@@ -4,10 +4,11 @@ from decrypt_image import decrypt_and_verify_image
 from decrypt_messaging import decrypt_and_verify_message
 
 # Test user config
-username = "helloworld1"
-password = "helloworld1"
-recipient = "bob1"
-message = "Hello Bob!"
+username = "jingkai"
+password = "jingkai"
+recipient = "xukai"
+password2 = "xukai"
+message = "Hello world"
 
 # IP + port simulation
 sender_ip = "127.0.0.1"
@@ -18,14 +19,14 @@ recipient_port = 5555
 # Step 1: Register users (if not already)
 try:
     register_user(username, password)
-    register_user(recipient, password)
+    register_user(recipient, password2)
 except Exception as e:
     print("Registration:", e)
 
 # Step 2: Login and bind IPs
 try:
     login_user(username, password, sender_ip, sender_port)
-    login_user(recipient, password, recipient_ip, recipient_port)
+    login_user(recipient, password2, recipient_ip, recipient_port)
 except Exception as e:
     print("Login:", e)
 
