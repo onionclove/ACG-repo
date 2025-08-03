@@ -1,209 +1,148 @@
 import os
 import sqlite3
-from getpass import getpass
-from encryption_utils import generate_dh_keypair, export_key, encrypt_private_key, save_key_to_file
+import base64
+import hashlib
+from encryption_utils import (
+    generate_dh_keypair, export_key, encrypt_private_key, save_key_to_file,
+    decrypt_private_key, load_key_from_file, sign_blob
+)
+from Crypto.PublicKey import ECC
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA256
 
 DB_PATH = '../server/db/user_db.sqlite'
 KEY_DIR = './keys/'
 
-def register_user():
-    username = input("Username: ")
-    password = getpass("Password: ")
-
-    import hashlib
-
-    # Open DB and ensure table has signing_public_key column
+def register_user(username, password):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # Create users table (permanent info)
     c.execute('''CREATE TABLE IF NOT EXISTS users (
-                 username TEXT PRIMARY KEY,
-                 salt BLOB,
-                 hash BLOB,
-                 public_key BLOB,
-                 signing_public_key BLOB)''')
+        username TEXT PRIMARY KEY,
+        salt BLOB,
+        hash BLOB,
+        public_key BLOB,
+        signing_public_key BLOB
+    )''')
+
+    # Create online_users table (session info)
+    c.execute('''CREATE TABLE IF NOT EXISTS online_users (
+        username TEXT PRIMARY KEY,
+        ip_address TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        updated_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
 
     # Check if user already exists
     c.execute("SELECT * FROM users WHERE username = ?", (username,))
     if c.fetchone():
-        print("Username already exists. LOL D:")
         conn.close()
-        return
+        raise ValueError("Username already exists.")
 
-    # === EXISTING: X25519 (exchange) keypair ===
+    # Generate keys
     priv_key, pub_key = generate_dh_keypair()
     priv_key_pem = export_key(priv_key).encode()
     pub_key_pem = export_key(pub_key).encode()
-
-    # Encrypt exchange private key with password
     encrypted_priv_key = encrypt_private_key(priv_key_pem, password.encode())
 
-    # === NEW: Ed25519 signing keypair ===
-    from Crypto.PublicKey import ECC
-    from encryption_utils import encrypt_private_key as _encrypt_private_key  # reuse your function
     sign_priv = ECC.generate(curve='Ed25519')
     sign_pub = sign_priv.public_key()
-
     sign_priv_pem = sign_priv.export_key(format='PEM').encode()
     sign_pub_pem = sign_pub.export_key(format='PEM').encode()
-
     encrypted_sign_priv = encrypt_private_key(sign_priv_pem, password.encode())
 
-    # Save the keys
+    # Save keys to files
     os.makedirs(KEY_DIR, exist_ok=True)
     save_key_to_file(KEY_DIR + f'{username}_public.pem', pub_key_pem)
     save_key_to_file(KEY_DIR + f'{username}_private.enc', encrypted_priv_key)
     save_key_to_file(KEY_DIR + f'{username}_signing_private.enc', encrypted_sign_priv)
 
-    # Hash password and store with public keys
+    # Hash password
     salt = os.urandom(16)
     pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
 
-    # Insert with explicit columns including signing public key
-    c.execute(
-        "INSERT INTO users (username, salt, hash, public_key, signing_public_key) VALUES (?, ?, ?, ?, ?)",
-        (username, salt, pwd_hash, pub_key_pem, sign_pub_pem)
-    )
+    # Store user info in DB
+    c.execute("INSERT INTO users (username, salt, hash, public_key, signing_public_key) VALUES (?, ?, ?, ?, ?)",
+              (username, salt, pwd_hash, pub_key_pem, sign_pub_pem))
+
+    conn.commit()
+    conn.close()
+    return True
+
+def login_user(username, password, ip_address, port):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # Verify password
+    c.execute("SELECT salt, hash FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        raise ValueError("User not found.")
+    salt, stored_hash = row
+    test_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
+    if test_hash != stored_hash:
+        conn.close()
+        raise ValueError("Incorrect password.")
+
+    # Store IP and port in online_users table
+    c.execute('''INSERT OR REPLACE INTO online_users (username, ip_address, port)
+                 VALUES (?, ?, ?)''', (username, ip_address, port))
     conn.commit()
     conn.close()
 
-    print("Registered successfully! :))")
-
-    # === DEBUG: test decryption (remove in production) ===
-    from encryption_utils import decrypt_private_key, load_key_from_file
-    enc_key = load_key_from_file(KEY_DIR + f'{username}_private.enc')
-    decrypted = decrypt_private_key(enc_key, password.encode())
-    print("Private key for checking (to remove in final):\n", decrypted[:128])  # Show first 128 bytes
-
-def login_user():
-    username = input("Username: ")
-    from getpass import getpass
-    password = getpass("Password: ")
-
-    import hashlib
-    from encryption_utils import decrypt_private_key, load_key_from_file
-    import os
-    import sqlite3
-
-    # Open DB connection
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    # Fetch user record
-    c.execute("SELECT salt, hash FROM users WHERE username = ?", (username,))
-    row = c.fetchone()
-
-    if not row:
-        print("No such user.")
-        conn.close()
-        return None, None, None
-
-    salt, stored_hash = row
-
-    # Hash input password using stored salt
-    test_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
-
-    # Verify password
-    if test_hash != stored_hash:
-        print("Incorrect password.")
-        conn.close()
-        return None, None, None
-
-    # Try to decrypt private key
+    # Load decrypted private key
     enc_key_path = os.path.join(KEY_DIR, f"{username}_private.enc")
-    if not os.path.exists(enc_key_path):
-        print("Encrypted private key file not found.")
-        return None, None, None
-
-    try:
-        encrypted_key = load_key_from_file(enc_key_path)
-        decrypted_key = decrypt_private_key(encrypted_key, password.encode())
-
-        print("Login successful! 🔐")
-        print("Private key loaded (partial):\n", decrypted_key[:128])
-
-        return username, password, decrypted_key
-
-    except Exception as e:
-        print("Error decrypting private key:", e)
-        return None, None, None
+    encrypted_key = load_key_from_file(enc_key_path)
+    decrypted_key = decrypt_private_key(encrypted_key, password.encode())
+    return decrypted_key
 
 def send_encrypted_message(sender_username, password, recipient_username, message):
-    from encryption_utils import decrypt_private_key, load_key_from_file, sign_blob
-    from Crypto.Cipher import AES
-    from Crypto.Hash import SHA256
-    from Crypto.PublicKey import ECC
-    import base64
-    import sqlite3
-
-    # === Load sender's encrypted exchange private key ===
-    priv_key_path = f"./keys/{sender_username}_private.enc"
-    encrypted_priv = load_key_from_file(priv_key_path)
+    encrypted_priv = load_key_from_file(f"./keys/{sender_username}_private.enc")
     priv_key_pem = decrypt_private_key(encrypted_priv, password.encode())
     sender_priv_key = ECC.import_key(priv_key_pem)
 
-    # === Load recipient's exchange public key from DB ===
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # Get recipient's key and IP/port from both tables
     c.execute("SELECT public_key FROM users WHERE username = ?", (recipient_username,))
-    row = c.fetchone()
+    user_row = c.fetchone()
+
+    c.execute("SELECT ip_address, port FROM online_users WHERE username = ?", (recipient_username,))
+    net_row = c.fetchone()
+
     conn.close()
 
-    if not row:
-        print("Recipient not found.")
-        return
+    if not user_row or not net_row:
+        raise ValueError("Recipient not found or offline.")
 
-    recipient_pub_pem = row[0]
+    recipient_pub_pem = user_row[0]
     if isinstance(recipient_pub_pem, memoryview):
         recipient_pub_pem = recipient_pub_pem.tobytes()
     recipient_pub_key = ECC.import_key(recipient_pub_pem)
 
-    # === Derive shared secret ===
+    recipient_ip, recipient_port = net_row
+
     shared_secret = sender_priv_key.d * recipient_pub_key.pointQ
     shared_secret_bytes = int(shared_secret.x).to_bytes(32, byteorder='big')
-
-    # === Derive AES key from shared secret ===
     aes_key = SHA256.new(shared_secret_bytes).digest()
 
-    # === Encrypt the message ===
     cipher = AES.new(aes_key, AES.MODE_EAX)
     ciphertext, tag = cipher.encrypt_and_digest(message.encode())
     nonce = cipher.nonce
-
-    # === SIGN the encrypted bundle ===
-    # Build blob: nonce || tag || ciphertext
     to_sign = nonce + tag + ciphertext
 
-    # Load & decrypt sender's signing private key
     signing_priv_enc = load_key_from_file(f"./keys/{sender_username}_signing_private.enc")
     signing_priv_pem = decrypt_private_key(signing_priv_enc, password.encode())
-
     signature = sign_blob(signing_priv_pem, to_sign)
 
-    # === Print values to simulate sending ===
-    print("\nEncrypted ECC message with signature:")
-    print("Nonce:", base64.b64encode(nonce).decode())
-    print("Tag:", base64.b64encode(tag).decode())
-    print("Ciphertext:", base64.b64encode(ciphertext).decode())
-    print("Signature:", base64.b64encode(signature).decode())
-
-
-if __name__ == "__main__":
-    choice = input("Type 'r' to register, 'l' to login: ").lower()
-
-    if choice == 'r':
-        register_user()
-
-    elif choice == 'l':
-        result = login_user()
-        if not result or result[0] is None:
-            exit()
-
-        username, password, decrypted_key = result
-
-        # Prompt for messaging
-        to_user = input("Send message to: ")
-        msg = input("Message to encrypt: ")
-        send_encrypted_message(username, password, to_user, msg)
-
-    else:
-        print("Invalid option.")
+    return {
+        "nonce": base64.b64encode(nonce).decode(),
+        "tag": base64.b64encode(tag).decode(),
+        "ciphertext": base64.b64encode(ciphertext).decode(),
+        "signature": base64.b64encode(signature).decode(),
+        "recipient_ip": recipient_ip,
+        "recipient_port": recipient_port
+    }
