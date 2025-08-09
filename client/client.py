@@ -82,12 +82,10 @@ def login_user(username, password, ip_address, port):
         VALUES (?, ?, ?)
         ON DUPLICATE KEY UPDATE ip_address=VALUES(ip_address), port=VALUES(port), updated_on=CURRENT_TIMESTAMP
     """), (username, ip_address, int(port)))
-    # Remove from offline if present
     c.execute(q("DELETE FROM offline_users WHERE username = ?"), (username,))
     conn.commit()
     conn.close()
 
-    # Load decrypted private key (for caller convenience)
     enc_key_path = os.path.join(KEY_DIR, f"{username}_private.enc")
     encrypted_key = load_key_from_file(enc_key_path)
     decrypted_key = decrypt_private_key(encrypted_key, password.encode())
@@ -107,23 +105,29 @@ def logout_user(username):
     conn.close()
 
 def send_encrypted_message(sender_username, password, recipient_username, message):
-    ensure_tables()
+    """
+    Encrypts + signs a message (ECDH + AES-EAX; EdDSA signature) and
+    returns the network bundle. Also persists ciphertext to MySQL
+    for chat history.
+    """
+    from encryption_utils import load_key_from_file, decrypt_private_key
+    from Crypto.PublicKey import ECC
+    from Crypto.Cipher import AES
+    from Crypto.Hash import SHA256
+    import base64, time
 
-    # Sender private
+    from mysql_wb import ensure_tables, get_conn, q
+
     encrypted_priv = load_key_from_file(f"./keys/{sender_username}_private.enc")
     priv_key_pem = decrypt_private_key(encrypted_priv, password.encode())
     sender_priv_key = ECC.import_key(priv_key_pem)
 
     conn = get_conn()
     c = conn.cursor()
-
-    # Recipient key + net
     c.execute(q("SELECT public_key FROM users WHERE username = ?"), (recipient_username,))
     user_row = c.fetchone()
-
     c.execute(q("SELECT ip_address, port FROM online_users WHERE username = ?"), (recipient_username,))
     net_row = c.fetchone()
-
     conn.close()
 
     if not user_row or not net_row:
@@ -136,19 +140,45 @@ def send_encrypted_message(sender_username, password, recipient_username, messag
 
     recipient_ip, recipient_port = net_row
 
-    # ECDH -> AES
     shared_secret = sender_priv_key.d * recipient_pub_key.pointQ
-    shared_secret_bytes = int(shared_secret.x).to_bytes(32, byteorder='big')
+    shared_secret_bytes = int(shared_secret.x).to_bytes(32, 'big')
     aes_key = SHA256.new(shared_secret_bytes).digest()
 
     cipher = AES.new(aes_key, AES.MODE_EAX)
     ciphertext, tag = cipher.encrypt_and_digest(message.encode())
     nonce = cipher.nonce
-    to_sign = nonce + tag + ciphertext
 
+    to_sign = nonce + tag + ciphertext
     signing_priv_enc = load_key_from_file(f"./keys/{sender_username}_signing_private.enc")
     signing_priv_pem = decrypt_private_key(signing_priv_enc, password.encode())
-    signature = sign_blob(signing_priv_pem, to_sign)
+    signature = sign_blob(signing_priv_pem, to_sign)  # you already have sign_blob()
+
+    digest = SHA256.new(
+        sender_username.encode() + recipient_username.encode() + to_sign
+    ).digest()
+
+    ensure_tables()
+    conn2 = get_conn()
+    try:
+        c2 = conn2.cursor()
+        c2.execute(q("""
+            INSERT IGNORE INTO messages
+            (msg_id, sender, recipient, ts, nonce_base64, tag_base64, ct_base64, signature_base64)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """), (
+            digest,
+            sender_username,
+            recipient_username,
+            int(time.time()),
+            base64.b64encode(nonce).decode(),
+            base64.b64encode(tag).decode(),
+            base64.b64encode(ciphertext).decode(),
+            base64.b64encode(signature).decode()
+        ))
+        conn2.commit()
+    finally:
+        try: conn2.close()
+        except: pass
 
     return {
         "nonce": base64.b64encode(nonce).decode(),

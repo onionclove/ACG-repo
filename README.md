@@ -105,3 +105,5 @@ We edited the GUI so that we are able to see a list of who is texting who, albei
 There was also an error where we could not text people that were offline as online users, which was fixed by adding a pending_messages database where messages can be sent in advance. Messages sent in advance are then delivered to that user once they are logged in.
 
 pip install mysql-connector-python python-dotenv
+
+Xu Kai: chat history code are in backend.py, client.py, mysql_wb.py and created file history.py cant test yet login problem whoever can login tell me i tell yall how to test

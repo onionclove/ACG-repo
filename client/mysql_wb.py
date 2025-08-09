@@ -84,6 +84,21 @@ def ensure_tables():
                 delivered TINYINT(1) DEFAULT 0
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                msg_id VARBINARY(32) UNIQUE,
+                sender VARCHAR(255) NOT NULL,
+                recipient VARCHAR(255) NOT NULL,
+                ts BIGINT NOT NULL,
+                nonce_base64 TEXT NOT NULL,
+                tag_base64 TEXT NOT NULL,
+                ct_base64 TEXT NOT NULL,
+                signature_base64 TEXT NOT NULL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_msg_thread_ts ON messages (sender, recipient, ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_msg_peer_ts ON messages (recipient, ts)")
         conn.commit()
     finally:
         conn.close()

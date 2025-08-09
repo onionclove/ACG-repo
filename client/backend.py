@@ -4,6 +4,9 @@ from datetime import datetime
 from Crypto.PublicKey import ECC
 from Crypto.Cipher import AES
 from Crypto.Hash import SHA256
+from mysql_wb import get_conn, q, ensure_tables
+import time, base64
+from Crypto.Hash import SHA256
 
 from encryption_utils import (
     generate_dh_keypair, export_key, encrypt_private_key, save_key_to_file,
@@ -424,16 +427,51 @@ def start_receiver(username, password, on_message, on_file):
 
             if bundle.get("type") == "text":
                 msg = decrypt_and_verify_message(
-                    priv_key_path=os.path.join(KEY_DIR, f"{my_username}_private.enc"),
-                    password=my_password,
-                    sender_pub_key_path=os.path.join(KEY_DIR, f"{bundle['sender']}_public.pem"),
-                    nonce_b64=bundle["nonce"],
-                    tag_b64=bundle["tag"],
-                    ciphertext_b64=bundle["ciphertext"],
-                    signature_b64=bundle["signature"],
-                    sender_username=bundle['sender']
+                    os.path.join(KEY_DIR, f"{my_username}_private.enc"),
+                    my_password,
+                    os.path.join(KEY_DIR, f"{bundle['sender']}_public.pem"),
+                    bundle["nonce"],
+                    bundle["tag"],
+                    bundle["ciphertext"],
+                    bundle["signature"],
+                    bundle["sender"]
                 )
-                cb_msg(bundle['sender'], msg)
+                cb_msg(bundle["sender"], msg)
+
+                # --- Persist incoming ciphertext to MySQL for history ---
+                ensure_tables()
+                conn2 = get_conn()
+                try:
+                    c2 = conn2.cursor()
+
+                    nonce_b = base64.b64decode(bundle["nonce"])
+                    tag_b = base64.b64decode(bundle["tag"])
+                    ct_b = base64.b64decode(bundle["ciphertext"])
+                    sig_b64 = bundle["signature"]
+
+                    digest = SHA256.new(
+                    bundle["sender"].encode() + my_username.encode() + (nonce_b + tag_b + ct_b)
+                    ).digest()
+
+                    c2.execute(q("""
+                    INSERT IGNORE INTO messages
+                    (msg_id, sender, recipient, ts, nonce_base64, tag_base64, ct_base64, signature_base64)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """), (
+                    digest,
+                    bundle["sender"],
+                    my_username,
+                    int(bundle.get("ts") or time.time()),
+                    bundle["nonce"],
+                    bundle["tag"],
+                    bundle["ciphertext"],
+                    sig_b64
+                    ))
+                    conn2.commit()
+                finally:
+                    conn2.close()
+
+
 
             elif bundle.get("type") == "file":
                 temp_path = f"temp_{bundle['filename']}"
