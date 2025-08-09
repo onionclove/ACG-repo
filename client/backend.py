@@ -1,4 +1,9 @@
 import os, json, socket, base64, hashlib, threading, sqlite3
+from datetime import datetime
+from Crypto.PublicKey import ECC
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA256
+
 from encryption_utils import (
     generate_dh_keypair, export_key, encrypt_private_key, save_key_to_file,
     decrypt_private_key, load_key_from_file, sign_blob
@@ -6,13 +11,11 @@ from encryption_utils import (
 from encrypt_image import encrypt_and_sign_image as encrypt_and_sign_file
 from decrypt_image import decrypt_and_verify_image as decrypt_and_verify_file
 from decrypt_messaging import decrypt_and_verify_message
-from Crypto.PublicKey import ECC
-from Crypto.Cipher import AES
-from Crypto.Hash import SHA256
 
 DB_PATH = '../server/db/user_db.sqlite'
 KEY_DIR = './keys/'
 
+# ---------- DB & AUTH ----------
 def ensure_tables():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -47,69 +50,137 @@ def register_user(username, password):
     ensure_tables()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE username = ?", (username,))
+    c.execute("SELECT 1 FROM users WHERE username = ?", (username,))
     if c.fetchone():
+        conn.close()
         raise ValueError("Username already exists.")
+
+    # ECDH keys
     priv_key, pub_key = generate_dh_keypair()
     priv_key_pem = export_key(priv_key).encode()
     pub_key_pem = export_key(pub_key).encode()
     encrypted_priv_key = encrypt_private_key(priv_key_pem, password.encode())
+
+    # Ed25519 signing keys
     sign_priv = ECC.generate(curve='Ed25519')
     sign_pub = sign_priv.public_key()
     sign_priv_pem = sign_priv.export_key(format='PEM').encode()
     sign_pub_pem = sign_pub.export_key(format='PEM').encode()
     encrypted_sign_priv = encrypt_private_key(sign_priv_pem, password.encode())
+
     os.makedirs(KEY_DIR, exist_ok=True)
-    save_key_to_file(KEY_DIR + f'{username}_public.pem', pub_key_pem)
-    save_key_to_file(KEY_DIR + f'{username}_private.enc', encrypted_priv_key)
-    save_key_to_file(KEY_DIR + f'{username}_signing_private.enc', encrypted_sign_priv)
+    save_key_to_file(os.path.join(KEY_DIR, f'{username}_public.pem'), pub_key_pem)
+    save_key_to_file(os.path.join(KEY_DIR, f'{username}_private.enc'), encrypted_priv_key)
+    save_key_to_file(os.path.join(KEY_DIR, f'{username}_signing_private.enc'), encrypted_sign_priv)
+
     salt = os.urandom(16)
     pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
-    c.execute("INSERT INTO users (username, salt, hash, public_key, signing_public_key) VALUES (?, ?, ?, ?, ?)",
-              (username, salt, pwd_hash, pub_key_pem, sign_pub_pem))
+    c.execute(
+        "INSERT INTO users (username, salt, hash, public_key, signing_public_key) VALUES (?, ?, ?, ?, ?)",
+        (username, salt, pwd_hash, pub_key_pem, sign_pub_pem)
+    )
     conn.commit()
     conn.close()
 
-def login_user(username, password, ip, port):
+def _verify_login(username, password):
     ensure_tables()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT salt, hash FROM users WHERE username = ?", (username,))
     row = c.fetchone()
+    conn.close()
     if not row:
         raise ValueError("User not found.")
     salt, stored_hash = row
     pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
     if pwd_hash != stored_hash:
         raise ValueError("Incorrect password.")
-    c.execute("INSERT OR REPLACE INTO online_users (username, ip_address, port) VALUES (?, ?, ?)", (username, ip, port))
+
+def _set_online(username, ip, port):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO online_users (username, ip_address, port, updated_on) VALUES (?, ?, ?, ?)",
+        (username, ip, int(port), datetime.utcnow().isoformat(sep=' ', timespec='seconds'))
+    )
     conn.commit()
     conn.close()
 
+def _resolve_online(username):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT ip_address, port FROM online_users WHERE username = ?", (username,))
+    row = c.fetchone()
+    conn.close()
+    return row  # (ip, port) or None
+
+# ---------- NET HELPERS ----------
+def _best_local_ip():
+    """
+    Get the local IP that would be used for outbound traffic.
+    Works without sending data.
+    """
+    try:
+        tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tmp.connect(("8.8.8.8", 80))
+        ip = tmp.getsockname()[0]
+        tmp.close()
+        return ip
+    except Exception:
+        # Fallback
+        return socket.gethostbyname(socket.gethostname())
+
+# ---------- PUBLIC API ----------
+def login_user(username, password):
+    """
+    Only verifies credentials. Presence is registered by start_receiver()
+    after binding a real port.
+    """
+    _verify_login(username, password)
+
 def send_text_message(sender, password, recipient, message):
+    # Load recipient pubkey
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT public_key FROM users WHERE username = ?", (recipient,))
     pub_row = c.fetchone()
-    c.execute("SELECT ip_address, port FROM online_users WHERE username = ?", (recipient,))
-    ip_row = c.fetchone()
     conn.close()
-    if not pub_row or not ip_row:
-        raise ValueError("Recipient not found or offline.")
+    if not pub_row:
+        raise ValueError("Recipient not registered.")
+
+    # Resolve recipient address
+    ip_port = _resolve_online(recipient)
+    if not ip_port:
+        raise ValueError("Recipient is offline.")
+    recipient_ip, recipient_port = ip_port
+
     recipient_pub_pem = pub_row[0]
     if isinstance(recipient_pub_pem, memoryview):
         recipient_pub_pem = recipient_pub_pem.tobytes()
     recipient_pub_key = ECC.import_key(recipient_pub_pem)
-    recipient_ip, recipient_port = ip_row
-    priv_key_pem = decrypt_private_key(load_key_from_file(f"{KEY_DIR}{sender}_private.enc"), password.encode())
+
+    # Sender private (ECDH)
+    priv_key_pem = decrypt_private_key(
+        load_key_from_file(os.path.join(KEY_DIR, f"{sender}_private.enc")),
+        password.encode()
+    )
     sender_priv_key = ECC.import_key(priv_key_pem)
+
+    # ECDH shared secret -> AES key
     shared_secret = sender_priv_key.d * recipient_pub_key.pointQ
     aes_key = SHA256.new(int(shared_secret.x).to_bytes(32, 'big')).digest()
+
     cipher = AES.new(aes_key, AES.MODE_EAX)
     ciphertext, tag = cipher.encrypt_and_digest(message.encode())
     nonce = cipher.nonce
-    signing_priv_pem = decrypt_private_key(load_key_from_file(f"{KEY_DIR}{sender}_signing_private.enc"), password.encode())
+
+    # Sign (Ed25519)
+    signing_priv_pem = decrypt_private_key(
+        load_key_from_file(os.path.join(KEY_DIR, f"{sender}_signing_private.enc")),
+        password.encode()
+    )
     signature = sign_blob(signing_priv_pem, nonce + tag + ciphertext)
+
     bundle = {
         "type": "text",
         "nonce": base64.b64encode(nonce).decode(),
@@ -118,29 +189,29 @@ def send_text_message(sender, password, recipient, message):
         "signature": base64.b64encode(signature).decode(),
         "sender": sender
     }
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((recipient_ip, int(recipient_port)))
         s.sendall(json.dumps(bundle).encode())
 
 def send_encrypted_file(sender, password, recipient, file_path):
+    # Prepare temp encrypted blob
     output_path = "temp.enc"
     encrypt_and_sign_file(
-        priv_key_path=f"{KEY_DIR}{sender}_private.enc",
+        priv_key_path=os.path.join(KEY_DIR, f"{sender}_private.enc"),
         password=password,
-        recipient_pub_key_path=f"{KEY_DIR}{recipient}_public.pem",
+        recipient_pub_key_path=os.path.join(KEY_DIR, f"{recipient}_public.pem"),
         image_path=file_path,
         output_path=output_path
     )
     with open(output_path, "rb") as f:
         encrypted_data = base64.b64encode(f.read()).decode()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT ip_address, port FROM online_users WHERE username = ?", (recipient,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        raise ValueError("Recipient not online.")
-    recipient_ip, recipient_port = row
+
+    ip_port = _resolve_online(recipient)
+    if not ip_port:
+        raise ValueError("Recipient is offline.")
+    recipient_ip, recipient_port = ip_port
+
     bundle = {
         "type": "file",
         "file_data": encrypted_data,
@@ -151,41 +222,77 @@ def send_encrypted_file(sender, password, recipient, file_path):
         s.connect((recipient_ip, int(recipient_port)))
         s.sendall(json.dumps(bundle).encode())
 
-def start_receiver(username, password, ip, port, on_message, on_file):
-    def run():
-        login_user(username, password, ip, port)
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind((ip, port))
-            s.listen()
+def start_receiver(username, password, on_message, on_file):
+    """
+    Binds on 0.0.0.0, OS-chosen port; registers (ip, port) in online_users;
+    returns the bound port. Runs accept loop in a daemon thread.
+    """
+    _verify_login(username, password)  # ensure valid user
+
+    def run_server():
+        ip = "0.0.0.0"
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((ip, 0))  # 0 => free port
+        srv.listen()
+        bound_port = srv.getsockname()[1]
+
+        # pick best outward-facing local IP to advertise
+        adv_ip = _best_local_ip()
+        _set_online(username, adv_ip, bound_port)
+
+        # store for outer scope (so caller can know it)
+        start_receiver.bound_port = bound_port
+
+        while True:
+            conn, _addr = srv.accept()
+            threading.Thread(target=_handle_conn, args=(conn, username, password, on_message, on_file), daemon=True).start()
+
+    def _handle_conn(conn, my_username, my_password, cb_msg, cb_file):
+        with conn:
+            data = b""
             while True:
-                conn, _ = s.accept()
-                with conn:
-                    data = conn.recv(8192)
-                    bundle = json.loads(data.decode())
-                    if bundle['type'] == 'text':
-                        msg = decrypt_and_verify_message(
-                            priv_key_path=f"{KEY_DIR}{username}_private.enc",
-                            password=password,
-                            sender_pub_key_path=f"{KEY_DIR}{bundle['sender']}_public.pem",
-                            nonce_b64=bundle["nonce"],
-                            tag_b64=bundle["tag"],
-                            ciphertext_b64=bundle["ciphertext"],
-                            signature_b64=bundle["signature"],
-                            sender_username=bundle['sender']
-                        )
-                        on_message(bundle['sender'], msg)
-                    elif bundle['type'] == 'file':
-                        temp_path = f"temp_{bundle['filename']}"
-                        with open(temp_path, "wb") as f:
-                            f.write(base64.b64decode(bundle["file_data"]))
-                        output_path = "received_" + bundle['filename']
-                        decrypt_and_verify_file(
-                            priv_key_path=f"{KEY_DIR}{username}_private.enc",
-                            password=password,
-                            sender_pub_key_path=f"{KEY_DIR}{bundle['sender']}_public.pem",
-                            encrypted_image_path=temp_path,
-                            output_path=output_path,
-                            sender_username=bundle['sender']
-                        )
-                        on_file(bundle['sender'], output_path)
-    threading.Thread(target=run, daemon=True).start()
+                chunk = conn.recv(8192)
+                if not chunk:
+                    break
+                data += chunk
+            if not data:
+                return
+            bundle = json.loads(data.decode())
+
+            if bundle.get("type") == "text":
+                msg = decrypt_and_verify_message(
+                    priv_key_path=os.path.join(KEY_DIR, f"{my_username}_private.enc"),
+                    password=my_password,
+                    sender_pub_key_path=os.path.join(KEY_DIR, f"{bundle['sender']}_public.pem"),
+                    nonce_b64=bundle["nonce"],
+                    tag_b64=bundle["tag"],
+                    ciphertext_b64=bundle["ciphertext"],
+                    signature_b64=bundle["signature"],
+                    sender_username=bundle['sender']
+                )
+                cb_msg(bundle['sender'], msg)
+
+            elif bundle.get("type") == "file":
+                temp_path = f"temp_{bundle['filename']}"
+                with open(temp_path, "wb") as f:
+                    f.write(base64.b64decode(bundle["file_data"]))
+                output_path = "received_" + bundle['filename']
+                decrypt_and_verify_file(
+                    priv_key_path=os.path.join(KEY_DIR, f"{my_username}_private.enc"),
+                    password=my_password,
+                    sender_pub_key_path=os.path.join(KEY_DIR, f"{bundle['sender']}_public.pem"),
+                    encrypted_image_path=temp_path,
+                    output_path=output_path,
+                    sender_username=bundle['sender']
+                )
+                cb_file(bundle['sender'], output_path)
+
+    # start server thread
+    t = threading.Thread(target=run_server, daemon=True)
+    t.start()
+
+    # Wait until port known
+    while getattr(start_receiver, "bound_port", None) is None:
+        pass
+    return start_receiver.bound_port
