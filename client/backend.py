@@ -1,4 +1,5 @@
-import os, json, socket, base64, hashlib, threading, sqlite3
+# backend.py
+import os, json, socket, base64, hashlib, threading
 from datetime import datetime
 from Crypto.PublicKey import ECC
 from Crypto.Cipher import AES
@@ -12,29 +13,12 @@ from encrypt_image import encrypt_and_sign_image as encrypt_and_sign_file
 from decrypt_image import decrypt_and_verify_image as decrypt_and_verify_file
 from decrypt_messaging import decrypt_and_verify_message
 
-DB_PATH = '../server/db/user_db.sqlite'
+# === MySQL adapter ===
+from mysql_wb import get_conn, ensure_tables, q
+
 KEY_DIR = './keys/'
 
-# ---------- DB & AUTH ----------
-def ensure_tables():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        username TEXT PRIMARY KEY,
-        salt BLOB,
-        hash BLOB,
-        public_key BLOB,
-        signing_public_key BLOB
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS online_users (
-        username TEXT PRIMARY KEY,
-        ip_address TEXT NOT NULL,
-        port INTEGER NOT NULL,
-        updated_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    conn.commit()
-    conn.close()
-
+# ---------- AUTH HELPERS ----------
 def password_is_strong(password):
     return (
         len(password) >= 8 and
@@ -47,21 +31,23 @@ def password_is_strong(password):
 def register_user(username, password):
     if not password_is_strong(password):
         raise ValueError("Password must be at least 8 characters and include uppercase, lowercase, number, and symbol.")
-    ensure_tables()
-    conn = sqlite3.connect(DB_PATH)
+
+    ensure_tables() # Ensure tables exist in mySQL workbench
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT 1 FROM users WHERE username = ?", (username,))
+
+    # Already exists?
+    c.execute(q("SELECT 1 FROM users WHERE username = ?"), (username,))
     if c.fetchone():
         conn.close()
         raise ValueError("Username already exists.")
 
-    # ECDH keys
+    # Keys
     priv_key, pub_key = generate_dh_keypair()
     priv_key_pem = export_key(priv_key).encode()
     pub_key_pem = export_key(pub_key).encode()
     encrypted_priv_key = encrypt_private_key(priv_key_pem, password.encode())
 
-    # Ed25519 signing keys
     sign_priv = ECC.generate(curve='Ed25519')
     sign_pub = sign_priv.public_key()
     sign_priv_pem = sign_priv.export_key(format='PEM').encode()
@@ -75,8 +61,9 @@ def register_user(username, password):
 
     salt = os.urandom(16)
     pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
+
     c.execute(
-        "INSERT INTO users (username, salt, hash, public_key, signing_public_key) VALUES (?, ?, ?, ?, ?)",
+        q("INSERT INTO users (username, salt, hash, public_key, signing_public_key) VALUES (?, ?, ?, ?, ?)"),
         (username, salt, pwd_hash, pub_key_pem, sign_pub_pem)
     )
     conn.commit()
@@ -84,9 +71,9 @@ def register_user(username, password):
 
 def _verify_login(username, password):
     ensure_tables()
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT salt, hash FROM users WHERE username = ?", (username,))
+    c.execute(q("SELECT salt, hash FROM users WHERE username = ?"), (username,))
     row = c.fetchone()
     conn.close()
     if not row:
@@ -97,29 +84,29 @@ def _verify_login(username, password):
         raise ValueError("Incorrect password.")
 
 def _set_online(username, ip, port):
-    conn = sqlite3.connect(DB_PATH)
+    """
+    Upsert into online_users
+    """
+    conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO online_users (username, ip_address, port, updated_on) VALUES (?, ?, ?, ?)",
-        (username, ip, int(port), datetime.utcnow().isoformat(sep=' ', timespec='seconds'))
-    )
+    c.execute(q("""
+        INSERT INTO online_users (username, ip_address, port)
+        VALUES (?, ?, ?)
+        ON DUPLICATE KEY UPDATE ip_address=VALUES(ip_address), port=VALUES(port), updated_on=CURRENT_TIMESTAMP
+    """), (username, ip, int(port)))
     conn.commit()
     conn.close()
 
 def _resolve_online(username):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT ip_address, port FROM online_users WHERE username = ?", (username,))
+    c.execute(q("SELECT ip_address, port FROM online_users WHERE username = ?"), (username,))
     row = c.fetchone()
     conn.close()
     return row  # (ip, port) or None
 
 # ---------- NET HELPERS ----------
 def _best_local_ip():
-    """
-    Get the local IP that would be used for outbound traffic.
-    Works without sending data.
-    """
     try:
         tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         tmp.connect(("8.8.8.8", 80))
@@ -127,28 +114,31 @@ def _best_local_ip():
         tmp.close()
         return ip
     except Exception:
-        # Fallback
         return socket.gethostbyname(socket.gethostname())
 
 # ---------- PUBLIC API ----------
-def login_user(username, password):
+def login_user(username, password, ip=None, port=None):
     """
-    Only verifies credentials. Presence is registered by start_receiver()
-    after binding a real port.
+    Verify credentials. If ip and port provided, also set presence (online_users).
+    Useful for GUI flows that want to set presence without starting the receiver yet.
     """
     _verify_login(username, password)
+    if ip and port:
+        _set_online(username, ip, int(port))
 
 def send_text_message(sender, password, recipient, message):
-    # Load recipient pubkey
-    conn = sqlite3.connect(DB_PATH)
+    ensure_tables()
+
+    # Recipient key
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT public_key FROM users WHERE username = ?", (recipient,))
+    c.execute(q("SELECT public_key FROM users WHERE username = ?"), (recipient,))
     pub_row = c.fetchone()
     conn.close()
     if not pub_row:
         raise ValueError("Recipient not registered.")
 
-    # Resolve recipient address
+    # Recipient address
     ip_port = _resolve_online(recipient)
     if not ip_port:
         raise ValueError("Recipient is offline.")
@@ -166,7 +156,7 @@ def send_text_message(sender, password, recipient, message):
     )
     sender_priv_key = ECC.import_key(priv_key_pem)
 
-    # ECDH shared secret -> AES key
+    # ECDH -> AES
     shared_secret = sender_priv_key.d * recipient_pub_key.pointQ
     aes_key = SHA256.new(int(shared_secret.x).to_bytes(32, 'big')).digest()
 
@@ -174,7 +164,7 @@ def send_text_message(sender, password, recipient, message):
     ciphertext, tag = cipher.encrypt_and_digest(message.encode())
     nonce = cipher.nonce
 
-    # Sign (Ed25519)
+    # Signature
     signing_priv_pem = decrypt_private_key(
         load_key_from_file(os.path.join(KEY_DIR, f"{sender}_signing_private.enc")),
         password.encode()
@@ -195,13 +185,15 @@ def send_text_message(sender, password, recipient, message):
         s.sendall(json.dumps(bundle).encode())
 
 def send_encrypted_file(sender, password, recipient, file_path):
-    # Prepare temp encrypted blob
+    ensure_tables()
+
+    # Encrypt & sign file to temp
     output_path = "temp.enc"
     encrypt_and_sign_file(
         priv_key_path=os.path.join(KEY_DIR, f"{sender}_private.enc"),
         password=password,
         recipient_pub_key_path=os.path.join(KEY_DIR, f"{recipient}_public.pem"),
-        image_path=file_path,
+        image_path=file_path,            # function name says image, but works for any binary
         output_path=output_path
     )
     with open(output_path, "rb") as f:
@@ -224,32 +216,36 @@ def send_encrypted_file(sender, password, recipient, file_path):
 
 def start_receiver(username, password, on_message, on_file):
     """
-    Binds on 0.0.0.0, OS-chosen port; registers (ip, port) in online_users;
-    returns the bound port. Runs accept loop in a daemon thread.
+    Binds on 0.0.0.0 with an OS-chosen port; registers (ip, port) in online_users;
+    returns the bound port. Runs accept loop in a daemon thread and dispatches
+    to callbacks.
     """
-    _verify_login(username, password)  # ensure valid user
+    _verify_login(username, password)
 
     def run_server():
         ip = "0.0.0.0"
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((ip, 0))  # 0 => free port
+        srv.bind((ip, 0))  # free ephemeral port
         srv.listen()
         bound_port = srv.getsockname()[1]
 
-        # pick best outward-facing local IP to advertise
         adv_ip = _best_local_ip()
         _set_online(username, adv_ip, bound_port)
 
-        # store for outer scope (so caller can know it)
         start_receiver.bound_port = bound_port
 
         while True:
             conn, _addr = srv.accept()
-            threading.Thread(target=_handle_conn, args=(conn, username, password, on_message, on_file), daemon=True).start()
+            threading.Thread(
+                target=_handle_conn,
+                args=(conn, username, password, on_message, on_file),
+                daemon=True
+            ).start()
 
     def _handle_conn(conn, my_username, my_password, cb_msg, cb_file):
         with conn:
+            # naive read-all; for large payloads switch to length-prefixed framing
             data = b""
             while True:
                 chunk = conn.recv(8192)
@@ -282,17 +278,14 @@ def start_receiver(username, password, on_message, on_file):
                     priv_key_path=os.path.join(KEY_DIR, f"{my_username}_private.enc"),
                     password=my_password,
                     sender_pub_key_path=os.path.join(KEY_DIR, f"{bundle['sender']}_public.pem"),
-                    encrypted_image_path=temp_path,
+                    encrypted_image_path=temp_path,   # fn name says image, decrypts any binary
                     output_path=output_path,
                     sender_username=bundle['sender']
                 )
                 cb_file(bundle['sender'], output_path)
 
-    # start server thread
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
-
-    # Wait until port known
     while getattr(start_receiver, "bound_port", None) is None:
         pass
     return start_receiver.bound_port

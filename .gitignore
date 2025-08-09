@@ -1,0 +1,9 @@
+# .gitignore
+.env
+
+__pycache__/
+*.pyc
+*.pyo
+
+server/db/*.sqlite
+client/keys/*

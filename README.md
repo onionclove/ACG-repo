@@ -94,3 +94,6 @@ To:
 Sign the encrypted payload (nonce || tag || ciphertext) with the sender’s Ed25519 private key, producing a signature that is transmitted/appended.
 Verify that signature on the recipient side using the sender’s signing public key before attempting decryption.
 This ensures the recipient can trust who sent the message or image and that it wasn’t altered in transit, while preserving confidentiality through the existing ECDH+AES encryption. Added safe fallback logic for key material types, handled blob construction correctly, and enforced abort-on-signature-failure to prevent tampered data from being processed.
+
+
+pip install mysql-connector-python python-dotenv

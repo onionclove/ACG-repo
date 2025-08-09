@@ -1,5 +1,5 @@
+# client.py
 import os
-import sqlite3
 import base64
 import hashlib
 from encryption_utils import (
@@ -10,32 +10,20 @@ from Crypto.PublicKey import ECC
 from Crypto.Cipher import AES
 from Crypto.Hash import SHA256
 
-DB_PATH = '../server/db/user_db.sqlite'
+# === MySQL adapter ===
+from mysql_wb import get_conn, ensure_tables, q
+
 KEY_DIR = './keys/'
 
 def register_user(username, password):
-    conn = sqlite3.connect(DB_PATH)
+    ensure_tables()
+    conn = get_conn()
     c = conn.cursor()
 
-    # Create users table (permanent info)
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        username TEXT PRIMARY KEY,
-        salt BLOB,
-        hash BLOB,
-        public_key BLOB,
-        signing_public_key BLOB
-    )''')
-
-    # Create online_users table (session info)
-    c.execute('''CREATE TABLE IF NOT EXISTS online_users (
-        username TEXT PRIMARY KEY,
-        ip_address TEXT NOT NULL,
-        port INTEGER NOT NULL,
-        updated_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
+    # tbales created by ensure_tables()
 
     # Check if user already exists
-    c.execute("SELECT * FROM users WHERE username = ?", (username,))
+    c.execute(q("SELECT 1 FROM users WHERE username = ?"), (username,))
     if c.fetchone():
         conn.close()
         raise ValueError("Username already exists.")
@@ -46,6 +34,7 @@ def register_user(username, password):
     pub_key_pem = export_key(pub_key).encode()
     encrypted_priv_key = encrypt_private_key(priv_key_pem, password.encode())
 
+    # Ed25519 signing
     sign_priv = ECC.generate(curve='Ed25519')
     sign_pub = sign_priv.public_key()
     sign_priv_pem = sign_priv.export_key(format='PEM').encode()
@@ -63,7 +52,7 @@ def register_user(username, password):
     pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
 
     # Store user info in DB
-    c.execute("INSERT INTO users (username, salt, hash, public_key, signing_public_key) VALUES (?, ?, ?, ?, ?)",
+    c.execute(q("INSERT INTO users (username, salt, hash, public_key, signing_public_key) VALUES (?, ?, ?, ?, ?)"),
               (username, salt, pwd_hash, pub_key_pem, sign_pub_pem))
 
     conn.commit()
@@ -71,11 +60,12 @@ def register_user(username, password):
     return True
 
 def login_user(username, password, ip_address, port):
-    conn = sqlite3.connect(DB_PATH)
+    ensure_tables()
+    conn = get_conn()
     c = conn.cursor()
 
     # Verify password
-    c.execute("SELECT salt, hash FROM users WHERE username = ?", (username,))
+    c.execute(q("SELECT salt, hash FROM users WHERE username = ?"), (username,))
     row = c.fetchone()
     if not row:
         conn.close()
@@ -86,31 +76,37 @@ def login_user(username, password, ip_address, port):
         conn.close()
         raise ValueError("Incorrect password.")
 
-    # Store IP and port in online_users table
-    c.execute('''INSERT OR REPLACE INTO online_users (username, ip_address, port)
-                 VALUES (?, ?, ?)''', (username, ip_address, port))
+    # Upsert into online_users
+    c.execute(q("""
+        INSERT INTO online_users (username, ip_address, port)
+        VALUES (?, ?, ?)
+        ON DUPLICATE KEY UPDATE ip_address=VALUES(ip_address), port=VALUES(port), updated_on=CURRENT_TIMESTAMP
+    """), (username, ip_address, int(port)))
     conn.commit()
     conn.close()
 
-    # Load decrypted private key
+    # Load decrypted private key (for caller convenience)
     enc_key_path = os.path.join(KEY_DIR, f"{username}_private.enc")
     encrypted_key = load_key_from_file(enc_key_path)
     decrypted_key = decrypt_private_key(encrypted_key, password.encode())
     return decrypted_key
 
 def send_encrypted_message(sender_username, password, recipient_username, message):
+    ensure_tables()
+
+    # Sender private
     encrypted_priv = load_key_from_file(f"./keys/{sender_username}_private.enc")
     priv_key_pem = decrypt_private_key(encrypted_priv, password.encode())
     sender_priv_key = ECC.import_key(priv_key_pem)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
 
-    # Get recipient's key and IP/port from both tables
-    c.execute("SELECT public_key FROM users WHERE username = ?", (recipient_username,))
+    # Recipient key + net
+    c.execute(q("SELECT public_key FROM users WHERE username = ?"), (recipient_username,))
     user_row = c.fetchone()
 
-    c.execute("SELECT ip_address, port FROM online_users WHERE username = ?", (recipient_username,))
+    c.execute(q("SELECT ip_address, port FROM online_users WHERE username = ?"), (recipient_username,))
     net_row = c.fetchone()
 
     conn.close()
@@ -125,6 +121,7 @@ def send_encrypted_message(sender_username, password, recipient_username, messag
 
     recipient_ip, recipient_port = net_row
 
+    # ECDH -> AES
     shared_secret = sender_priv_key.d * recipient_pub_key.pointQ
     shared_secret_bytes = int(shared_secret.x).to_bytes(32, byteorder='big')
     aes_key = SHA256.new(shared_secret_bytes).digest()
@@ -144,5 +141,5 @@ def send_encrypted_message(sender_username, password, recipient_username, messag
         "ciphertext": base64.b64encode(ciphertext).decode(),
         "signature": base64.b64encode(signature).decode(),
         "recipient_ip": recipient_ip,
-        "recipient_port": recipient_port
+        "recipient_port": int(recipient_port)
     }
