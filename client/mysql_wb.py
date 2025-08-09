@@ -66,6 +66,24 @@ def ensure_tables():
                     ON UPDATE CURRENT_TIMESTAMP
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS offline_users (
+                username VARCHAR(255) PRIMARY KEY,
+                last_offline TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    ON UPDATE CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pending_messages (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                recipient VARCHAR(255) NOT NULL,
+                sender VARCHAR(255) NOT NULL,
+                msg_type VARCHAR(10) NOT NULL,
+                payload LONGBLOB NOT NULL,
+                created_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                delivered TINYINT(1) DEFAULT 0
+            )
+        """)
         conn.commit()
     finally:
         conn.close()

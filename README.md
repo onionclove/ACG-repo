@@ -96,4 +96,12 @@ Verify that signature on the recipient side using the sender’s signing public 
 This ensures the recipient can trust who sent the message or image and that it wasn’t altered in transit, while preserving confidentiality through the existing ECDH+AES encryption. Added safe fallback logic for key material types, handled blob construction correctly, and enforced abort-on-signature-failure to prevent tampered data from being processed.
 
 
+Jerome & Craig: We added offline_users into the database so that we are able to differentiate between who is offline and online.
+
+We also added a log-out feature where the user is made offline, and the GUI gets rid of the texts and chat list. 
+
+We edited the GUI so that we are able to see a list of who is texting who, albeit there not being a history, however that is Xu Kai's part.
+
+There was also an error where we could not text people that were offline as online users, which was fixed by adding a pending_messages database where messages can be sent in advance. Messages sent in advance are then delivered to that user once they are logged in.
+
 pip install mysql-connector-python python-dotenv

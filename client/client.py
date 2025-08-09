@@ -82,6 +82,8 @@ def login_user(username, password, ip_address, port):
         VALUES (?, ?, ?)
         ON DUPLICATE KEY UPDATE ip_address=VALUES(ip_address), port=VALUES(port), updated_on=CURRENT_TIMESTAMP
     """), (username, ip_address, int(port)))
+    # Remove from offline if present
+    c.execute(q("DELETE FROM offline_users WHERE username = ?"), (username,))
     conn.commit()
     conn.close()
 
@@ -90,6 +92,19 @@ def login_user(username, password, ip_address, port):
     encrypted_key = load_key_from_file(enc_key_path)
     decrypted_key = decrypt_private_key(encrypted_key, password.encode())
     return decrypted_key
+
+def logout_user(username):
+    ensure_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(q("DELETE FROM online_users WHERE username = ?"), (username,))
+    c.execute(q("""
+        INSERT INTO offline_users (username)
+        VALUES (?)
+        ON DUPLICATE KEY UPDATE last_offline=CURRENT_TIMESTAMP
+    """), (username,))
+    conn.commit()
+    conn.close()
 
 def send_encrypted_message(sender_username, password, recipient_username, message):
     ensure_tables()

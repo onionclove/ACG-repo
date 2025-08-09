@@ -94,6 +94,8 @@ def _set_online(username, ip, port):
         VALUES (?, ?, ?)
         ON DUPLICATE KEY UPDATE ip_address=VALUES(ip_address), port=VALUES(port), updated_on=CURRENT_TIMESTAMP
     """), (username, ip, int(port)))
+    # Remove from offline when user is online
+    c.execute(q("DELETE FROM offline_users WHERE username = ?"), (username,))
     conn.commit()
     conn.close()
 
@@ -104,6 +106,81 @@ def _resolve_online(username):
     row = c.fetchone()
     conn.close()
     return row  # (ip, port) or None
+
+def _enqueue_message(recipient: str, sender: str, msg_type: str, payload: bytes) -> None:
+    """Store a message for later delivery when recipient is offline.
+    msg_type: 'text' | 'file'
+    payload: bytes blob (we store the JSON bundle as bytes)
+    """
+    ensure_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(q("""
+        INSERT INTO pending_messages (recipient, sender, msg_type, payload)
+        VALUES (?, ?, ?, ?)
+    """), (recipient, sender, msg_type, payload))
+    conn.commit()
+    conn.close()
+
+def _drain_pending(recipient: str, password: str, on_message, on_file):
+    """Deliver any queued messages to this recipient now that they are online.
+    Uses the same on_message/on_file callbacks as live delivery.
+    """
+    ensure_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(q("SELECT id, sender, msg_type, payload FROM pending_messages WHERE recipient = ? AND delivered = 0 ORDER BY id ASC"), (recipient,))
+    rows = c.fetchall() or []
+    for msg_id, sender, msg_type, payload in rows:
+        try:
+            bundle = json.loads(payload.decode())
+            if msg_type == 'text':
+                msg = decrypt_and_verify_message(
+                    priv_key_path=os.path.join(KEY_DIR, f"{recipient}_private.enc"),
+                    password=password,
+                    sender_pub_key_path=os.path.join(KEY_DIR, f"{sender}_public.pem"),
+                    nonce_b64=bundle["nonce"],
+                    tag_b64=bundle["tag"],
+                    ciphertext_b64=bundle["ciphertext"],
+                    signature_b64=bundle["signature"],
+                    sender_username=sender
+                )
+                on_message(sender, msg)
+            elif msg_type == 'file':
+                temp_path = f"temp_{bundle['filename']}"
+                with open(temp_path, "wb") as f:
+                    f.write(base64.b64decode(bundle["file_data"]))
+                output_path = "received_" + bundle['filename']
+                decrypt_and_verify_file(
+                    priv_key_path=os.path.join(KEY_DIR, f"{recipient}_private.enc"),
+                    password=password,
+                    sender_pub_key_path=os.path.join(KEY_DIR, f"{sender}_public.pem"),
+                    encrypted_image_path=temp_path,
+                    output_path=output_path,
+                    sender_username=sender
+                )
+                on_file(sender, output_path)
+            # Mark delivered
+            c2 = conn.cursor()
+            c2.execute(q("UPDATE pending_messages SET delivered = 1 WHERE id = ?"), (msg_id,))
+            conn.commit()
+        except Exception:
+            # keep in queue; could log
+            pass
+    conn.close()
+
+def _set_offline(username):
+    """Move user to offline_users and remove any online presence."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(q("DELETE FROM online_users WHERE username = ?"), (username,))
+    c.execute(q("""
+        INSERT INTO offline_users (username)
+        VALUES (?)
+        ON DUPLICATE KEY UPDATE last_offline=CURRENT_TIMESTAMP
+    """), (username,))
+    conn.commit()
+    conn.close()
 
 # ---------- NET HELPERS ----------
 def _best_local_ip():
@@ -126,6 +203,42 @@ def login_user(username, password, ip=None, port=None):
     if ip and port:
         _set_online(username, ip, int(port))
 
+def logout_user(username):
+    """Public API to mark a user offline."""
+    _set_offline(username)
+
+def reset_all_presence():
+    """Move every entry in online_users to offline_users and clear online_users.
+    Useful for cleanup when stale sessions remain marked online.
+    """
+    ensure_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    # Upsert all current online users into offline_users with current timestamp
+    c.execute(q("SELECT username FROM online_users"))
+    rows = c.fetchall() or []
+    for (uname,) in rows:
+        c.execute(q("""
+            INSERT INTO offline_users (username)
+            VALUES (?)
+            ON DUPLICATE KEY UPDATE last_offline=CURRENT_TIMESTAMP
+        """), (uname,))
+    # Clear online table
+    c.execute(q("DELETE FROM online_users"))
+    conn.commit()
+    conn.close()
+
+def is_user_online(username):
+    """Return True if the user has an entry in online_users, else False."""
+    ensure_tables()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(q("SELECT 1 FROM online_users WHERE username = ?"), (username,))
+        return c.fetchone() is not None
+    finally:
+        conn.close()
+
 def send_text_message(sender, password, recipient, message):
     ensure_tables()
 
@@ -141,7 +254,40 @@ def send_text_message(sender, password, recipient, message):
     # Recipient address
     ip_port = _resolve_online(recipient)
     if not ip_port:
-        raise ValueError("Recipient is offline.")
+        # Prepare encrypted bundle and enqueue for later delivery
+        recipient_pub_pem = pub_row[0]
+        if isinstance(recipient_pub_pem, memoryview):
+            recipient_pub_pem = recipient_pub_pem.tobytes()
+        recipient_pub_key = ECC.import_key(recipient_pub_pem)
+
+        priv_key_pem = decrypt_private_key(
+            load_key_from_file(os.path.join(KEY_DIR, f"{sender}_private.enc")),
+            password.encode()
+        )
+        sender_priv_key = ECC.import_key(priv_key_pem)
+
+        shared_secret = sender_priv_key.d * recipient_pub_key.pointQ
+        aes_key = SHA256.new(int(shared_secret.x).to_bytes(32, 'big')).digest()
+        cipher = AES.new(aes_key, AES.MODE_EAX)
+        ciphertext, tag = cipher.encrypt_and_digest(message.encode())
+        nonce = cipher.nonce
+
+        signing_priv_pem = decrypt_private_key(
+            load_key_from_file(os.path.join(KEY_DIR, f"{sender}_signing_private.enc")),
+            password.encode()
+        )
+        signature = sign_blob(signing_priv_pem, nonce + tag + ciphertext)
+
+        bundle = {
+            "type": "text",
+            "nonce": base64.b64encode(nonce).decode(),
+            "tag": base64.b64encode(tag).decode(),
+            "ciphertext": base64.b64encode(ciphertext).decode(),
+            "signature": base64.b64encode(signature).decode(),
+            "sender": sender
+        }
+        _enqueue_message(recipient, sender, 'text', json.dumps(bundle).encode())
+        return
     recipient_ip, recipient_port = ip_port
 
     recipient_pub_pem = pub_row[0]
@@ -201,7 +347,14 @@ def send_encrypted_file(sender, password, recipient, file_path):
 
     ip_port = _resolve_online(recipient)
     if not ip_port:
-        raise ValueError("Recipient is offline.")
+        bundle = {
+            "type": "file",
+            "file_data": encrypted_data,
+            "filename": os.path.basename(file_path),
+            "sender": sender
+        }
+        _enqueue_message(recipient, sender, 'file', json.dumps(bundle).encode())
+        return
     recipient_ip, recipient_port = ip_port
 
     bundle = {
@@ -234,14 +387,27 @@ def start_receiver(username, password, on_message, on_file):
         _set_online(username, adv_ip, bound_port)
 
         start_receiver.bound_port = bound_port
+        # After coming online, deliver any queued messages
+        try:
+            _drain_pending(username, password, on_message, on_file)
+        except Exception:
+            pass
+        start_receiver.server_socket = srv
 
-        while True:
-            conn, _addr = srv.accept()
+        while not start_receiver.stop_event.is_set():
+            try:
+                conn, _addr = srv.accept()
+            except OSError:
+                break
             threading.Thread(
                 target=_handle_conn,
                 args=(conn, username, password, on_message, on_file),
                 daemon=True
             ).start()
+        try:
+            srv.close()
+        except Exception:
+            pass
 
     def _handle_conn(conn, my_username, my_password, cb_msg, cb_file):
         with conn:
@@ -284,8 +450,20 @@ def start_receiver(username, password, on_message, on_file):
                 )
                 cb_file(bundle['sender'], output_path)
 
+    start_receiver.stop_event = threading.Event()
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
     while getattr(start_receiver, "bound_port", None) is None:
         pass
     return start_receiver.bound_port
+
+def stop_receiver():
+    ev = getattr(start_receiver, "stop_event", None)
+    if ev:
+        ev.set()
+    srv = getattr(start_receiver, "server_socket", None)
+    if srv:
+        try:
+            srv.close()
+        except Exception:
+            pass
