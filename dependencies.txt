@@ -1,4 +1,0 @@
-pycryptodome
-tkinter (tk)
-flask
-
