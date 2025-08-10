@@ -87,6 +87,16 @@ CREATE_STMTS = [
         signature_base64 TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS sent_messages (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        sender      VARCHAR(255) NOT NULL,
+        recipient   VARCHAR(255) NOT NULL,
+        ts          BIGINT NOT NULL,
+        plaintext   LONGTEXT NOT NULL,
+        INDEX idx_sent_pair_ts (sender, recipient, ts)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """
 ]
 
 INDEXES = [

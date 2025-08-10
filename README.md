@@ -112,4 +112,3 @@ Jotish: Pending messages in both PFS on and off now get sent. When the user read
 GUI now displays ALL online and offline users in the chats column, logged out/unregistered users can also view this list. Dynamically updated every 3 seconds.
 
 Xu Kai: chat history code are in backend.py, client.py, mysql_wb.py and created file history.py cant test yet login problem whoever can login tell me i tell yall how to test
-
