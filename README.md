@@ -45,7 +45,7 @@ python gui.py
 
 ### Features
 - End-to-end encryption (AES-EAX) with Ed25519 signatures
-- Optional PFS per-message (ephemeral X25519 + HKDF)
+- Optional PFS per-message for users (ephemeral X25519 + HKDF)
 - Offline delivery queue in MySQL; auto-delivery on return
 - Online presence; chat history (ciphertexts in DB, sent plaintext kept locally)
 - File transfer: encrypt/sign any file; recipient verifies and decrypts
@@ -68,7 +68,6 @@ pip install pycryptodome mysql-connector-python python-dotenv tk
 Create `.env` in the repo root:
 ```ini
 DB_HOST=localhost
-DB_PORT=3306
 DB_USER=your_mysql_user
 DB_PASSWORD=your_mysql_password
 DB_DATABASE=acg
@@ -77,7 +76,7 @@ The app loads this in `client/mysql_wb.py` and will create the database if missi
 
 ### Initialize/reset schema
 ```powershell
-python .\client\init_tables.py --force --seed
+python .\client\init_tables.py --force
 ```
 - `--force`: drop and recreate tables
 - `--seed`: add demo users `alice` (Alice$123) and `bob` (Bob$12345) and generate keys in `client/keys/`
