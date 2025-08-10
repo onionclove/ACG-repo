@@ -48,11 +48,12 @@ def ensure_tables():
     conn = _connect_with_db()
     try:
         c = conn.cursor()
+
         c.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 username VARCHAR(255) PRIMARY KEY,
-                salt BLOB,
-                hash BLOB,
+                salt VARBINARY(16),
+                hash VARBINARY(64),
                 public_key BLOB,
                 signing_public_key BLOB
             )
@@ -87,7 +88,7 @@ def ensure_tables():
         c.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                msg_id VARBINARY(32) UNIQUE,
+                msg_id BINARY(32) NOT NULL UNIQUE,
                 sender VARCHAR(255) NOT NULL,
                 recipient VARCHAR(255) NOT NULL,
                 ts BIGINT NOT NULL,
@@ -97,11 +98,29 @@ def ensure_tables():
                 signature_base64 TEXT NOT NULL
             )
         """)
-        c.execute("CREATE INDEX IF NOT EXISTS idx_msg_thread_ts ON messages (sender, recipient, ts)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_msg_peer_ts ON messages (recipient, ts)")
+
+        # --- create indexes if missing ---
+        def ensure_index(table, index):
+            c.execute("""
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM information_schema.statistics
+                    WHERE table_schema = DATABASE()
+                      AND table_name = %s
+                      AND index_name = %s
+                )
+            """, (table, index))
+            return bool(c.fetchone()[0])
+
+        if not ensure_index('messages', 'idx_msg_thread_ts'):
+            c.execute("CREATE INDEX idx_msg_thread_ts ON messages (sender, recipient, ts)")
+        if not ensure_index('messages', 'idx_msg_peer_ts'):
+            c.execute("CREATE INDEX idx_msg_peer_ts ON messages (recipient, ts)")
+
         conn.commit()
     finally:
         conn.close()
+
 
 def q(sql: str) -> str:
     return sql.replace("?", "%s")
