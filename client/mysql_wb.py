@@ -1,10 +1,11 @@
-# This file is used to connect the backend to mysql workbench for ankit to have a nice ui to look at
-#we refactor backend and client.py to work with mysql workbench
+# mysql_wb.py
+# Clean MySQL adapter for your chat app
+
 import os
 from dotenv import load_dotenv
 import mysql.connector
 
-
+# Load .env from project root (one level up from /client)
 ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
 load_dotenv(ENV_PATH)
 
@@ -34,7 +35,8 @@ def ensure_database():
     conn = _connect_no_db()
     try:
         c = conn.cursor()
-        c.execute(f"CREATE DATABASE IF NOT EXISTS `{DB_NAME}`")
+        # backticks to avoid weird names
+        c.execute(f"CREATE DATABASE IF NOT EXISTS `{DB_NAME}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
         conn.commit()
     finally:
         conn.close()
@@ -43,84 +45,86 @@ def get_conn():
     ensure_database()
     return _connect_with_db()
 
+def _exec(cursor, sql):
+    """Small helper so if something breaks, you see exactly what."""
+    try:
+        cursor.execute(sql)
+    except mysql.connector.Error as e:
+        raise RuntimeError(f"MySQL error {e.errno} on SQL:\n{sql}\n{e.msg}") from e
+
 def ensure_tables():
     ensure_database()
     conn = _connect_with_db()
     try:
         c = conn.cursor()
 
-        c.execute("""
+        # users table (identity + public keys)
+        _exec(c, """
             CREATE TABLE IF NOT EXISTS users (
-                username VARCHAR(255) PRIMARY KEY,
-                salt VARBINARY(16),
-                hash VARBINARY(64),
-                public_key BLOB,
-                signing_public_key BLOB
-            )
+                username           VARCHAR(255) PRIMARY KEY,
+                salt               VARBINARY(16) NOT NULL,
+                hash               VARBINARY(32) NOT NULL,     -- PBKDF2-HMAC-SHA256(32 bytes)
+                public_key         LONGBLOB NOT NULL,
+                signing_public_key LONGBLOB NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
-        c.execute("""
+
+        # online presence
+        _exec(c, """
             CREATE TABLE IF NOT EXISTS online_users (
-                username VARCHAR(255) PRIMARY KEY,
+                username   VARCHAR(255) PRIMARY KEY,
                 ip_address VARCHAR(255) NOT NULL,
-                port INT NOT NULL,
+                port       INT NOT NULL,
                 updated_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    ON UPDATE CURRENT_TIMESTAMP
-            )
+                           ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
-        c.execute("""
+
+        # offline records (last seen)
+        _exec(c, """
             CREATE TABLE IF NOT EXISTS offline_users (
-                username VARCHAR(255) PRIMARY KEY,
+                username    VARCHAR(255) PRIMARY KEY,
                 last_offline TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    ON UPDATE CURRENT_TIMESTAMP
-            )
+                              ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
-        c.execute("""
+
+        # pending messages queue (recipient offline)
+        # use VARCHAR instead of ENUM to avoid version-specific SQL issues
+        _exec(c, """
             CREATE TABLE IF NOT EXISTS pending_messages (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                recipient VARCHAR(255) NOT NULL,
-                sender VARCHAR(255) NOT NULL,
-                msg_type VARCHAR(10) NOT NULL,
-                payload LONGBLOB NOT NULL,
-                created_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                delivered TINYINT(1) DEFAULT 0
-            )
+                id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+                recipient  VARCHAR(255) NOT NULL,
+                sender     VARCHAR(255) NOT NULL,
+                msg_type   VARCHAR(8)   NOT NULL,  -- 'text' or 'file'
+                payload    MEDIUMBLOB   NOT NULL,  -- JSON bundle as bytes
+                delivered  TINYINT(1)   DEFAULT 0,
+                queued_on  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+                INDEX (recipient),
+                INDEX (delivered)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
-        c.execute("""
+
+        # message history (optional)
+        _exec(c, """
             CREATE TABLE IF NOT EXISTS messages (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                msg_id BINARY(32) NOT NULL UNIQUE,
-                sender VARCHAR(255) NOT NULL,
-                recipient VARCHAR(255) NOT NULL,
-                ts BIGINT NOT NULL,
-                nonce_base64 TEXT NOT NULL,
-                tag_base64 TEXT NOT NULL,
-                ct_base64 TEXT NOT NULL,
-                signature_base64 TEXT NOT NULL
-            )
+                msg_id            CHAR(64) PRIMARY KEY,   -- SHA-256 hex
+                sender            VARCHAR(255) NOT NULL,
+                recipient         VARCHAR(255) NOT NULL,
+                ts                BIGINT NOT NULL,
+                nonce_base64      TEXT NOT NULL,
+                tag_base64        TEXT NOT NULL,
+                ct_base64         LONGTEXT NOT NULL,
+                signature_base64  TEXT NOT NULL,
+                INDEX idx_msg_peer_ts (recipient, ts),
+                INDEX idx_msg_thread_ts (sender, recipient, ts)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
-
-        # --- create indexes if missing ---
-        def ensure_index(table, index):
-            c.execute("""
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM information_schema.statistics
-                    WHERE table_schema = DATABASE()
-                      AND table_name = %s
-                      AND index_name = %s
-                )
-            """, (table, index))
-            return bool(c.fetchone()[0])
-
-        if not ensure_index('messages', 'idx_msg_thread_ts'):
-            c.execute("CREATE INDEX idx_msg_thread_ts ON messages (sender, recipient, ts)")
-        if not ensure_index('messages', 'idx_msg_peer_ts'):
-            c.execute("CREATE INDEX idx_msg_peer_ts ON messages (recipient, ts)")
 
         conn.commit()
     finally:
         conn.close()
 
-
 def q(sql: str) -> str:
+    """Translate SQLite-style '?' placeholders to MySQL '%s'."""
     return sql.replace("?", "%s")
