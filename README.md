@@ -95,6 +95,8 @@ Sign the encrypted payload (nonce || tag || ciphertext) with the sender’s Ed25
 Verify that signature on the recipient side using the sender’s signing public key before attempting decryption.
 This ensures the recipient can trust who sent the message or image and that it wasn’t altered in transit, while preserving confidentiality through the existing ECDH+AES encryption. Added safe fallback logic for key material types, handled blob construction correctly, and enforced abort-on-signature-failure to prevent tampered data from being processed.
 
+Jotish: Made it so that users don't need to manually insert the ip and port of the user they want to contact, backend automatically scans and resolves them. Logged in users also dynamically get assigned a port upon each login. 
+
 
 Jerome & Craig: We added offline_users into the database so that we are able to differentiate between who is offline and online.
 
@@ -106,4 +108,8 @@ There was also an error where we could not text people that were offline as onli
 
 pip install mysql-connector-python python-dotenv
 
+Jotish: Pending messages in both PFS on and off now get sent. When the user reads their pending messages, they get deleted from the table and get sent to the messages table that shows all officially sent messages.
+GUI now displays ALL online and offline users in the chats column, logged out/unregistered users can also view this list. Dynamically updated every 3 seconds.
+
 Xu Kai: chat history code are in backend.py, client.py, mysql_wb.py and created file history.py cant test yet login problem whoever can login tell me i tell yall how to test
+

@@ -5,13 +5,18 @@ import threading
 from backend import (
     register_user, login_user, logout_user, is_user_online,
     start_receiver, stop_receiver,
-    send_text_message, send_text_message_pfs, send_encrypted_file
+    send_text_message, send_text_message_pfs, send_encrypted_file,
+    view_pending_for_contact,
+    list_all_users
 )
 
 gui_user = {"username": None, "password": None, "port": None, "receiver_started": False}
 contacts = []            # list[str]
 conversations = {}       # dict[str, list[str]]
 selected_contact = {"username": None}
+contacts_index = []          # listbox row -> username (None for headers)
+_last_render_state = {"hash": None}
+
 
 # -------------- UI helpers --------------
 def ui_call(fn, *args, **kwargs):
@@ -42,17 +47,30 @@ def set_logged_in(username: str, bound_port: int):
     register_btn.config(state=tk.DISABLED)
     user_entry.config(state=tk.DISABLED)
     pass_entry.config(state=tk.DISABLED)
+    try:
+        all_users = list_all_users(exclude=username)
+        contacts.clear()
+        contacts.extend(all_users)
+        for u in all_users:
+            conversations.setdefault(u, [])   # keep existing chat history dict
+        refresh_contacts_list()
+    except Exception as e:
+        print("Failed to load users:", e)
+
+    
 
 def set_logged_out():
     gui_user.update(username=None, password=None, port=None, receiver_started=False)
     status_label.config(text="Not logged in", fg="red")
-    contacts.clear()
-    conversations.clear()
+
+    # keep chat history dict; just deselect the open chat
     selected_contact["username"] = None
-    refresh_contacts_list()
+
+    # clear chat view
     chat_box.config(state=tk.NORMAL)
     chat_box.delete(1.0, tk.END)
     msg_frame.pack_forget()
+
     # disable chat controls
     new_chat_btn.config(state=tk.DISABLED)
     send_btn.config(state=tk.DISABLED)
@@ -62,6 +80,16 @@ def set_logged_out():
     register_btn.config(state=tk.NORMAL)
     user_entry.config(state=tk.NORMAL)
     pass_entry.config(state=tk.NORMAL)
+
+    # RELOAD roster (no exclude) so it looks like on app start
+    try:
+        users = list_all_users()
+        contacts[:] = users
+        for u in users:
+            conversations.setdefault(u, [])
+        refresh_contacts_list()
+    except Exception as e:
+        print("Failed to load users on logout:", e)
 
 def clear_placeholder_on_focus(entry, placeholder):
     def _on_focus_in(_):
@@ -246,36 +274,116 @@ def new_chat_prompt():
 new_chat_btn = tk.Button(left_frame, text="New Chat", command=new_chat_prompt, state=tk.DISABLED)
 new_chat_btn.pack(anchor="w", pady=4)
 
-def refresh_contacts_list():
-    # preserve selection
-    selected_name = selected_contact["username"]
-    contacts_listbox.delete(0, tk.END)
-    for name in contacts:
+
+def split_online_offline(names):
+    online, offline = [], []
+    for n in sorted(names, key=str.lower):
         try:
-            status = "🟢" if is_user_online(name) else "⚪"
+            (online if is_user_online(n) else offline).append(n)
         except Exception:
-            status = "?"
-        contacts_listbox.insert(tk.END, f"{status} {name}")
+            offline.append(n)
+    return online, offline
+
+def rebuild_contacts_list():
+    global contacts_index
+    # remember scroll + selection
+    y = contacts_listbox.yview()
+    prev_selected = None
+    if contacts_listbox.curselection():
+        prev_idx = contacts_listbox.curselection()[0]
+        if 0 <= prev_idx < len(contacts_index):
+            prev_selected = contacts_index[prev_idx]
+
+    contacts_listbox.delete(0, tk.END)
+
+    online, offline = split_online_offline(contacts)
+
+    def add_header(text):
+        contacts_listbox.insert(tk.END, text)
+        idx = contacts_listbox.size() - 1
+        contacts_index.append(None)
+        contacts_listbox.itemconfig(idx, foreground="#888", background="#f0f0f0",
+                                    selectforeground="#888", selectbackground="#f0f0f0")
+
+    def add_user(name, online_flag):
+        dot = "🟢" if online_flag else "🔴"   # green for online, red for offline
+        contacts_listbox.insert(tk.END, f"{dot} {name}")
+        contacts_index.append(name)
+
+    add_header("— ONLINE —")
+    if online:
+        for n in online: add_user(n, True)
+    else:
+        contacts_listbox.insert(tk.END, "(no one online)")
+        contacts_index.append(None)
+        contacts_listbox.itemconfig(contacts_listbox.size()-1, foreground="#aaa")
+
+    add_header("— OFFLINE —")
+    if offline:
+        for n in offline: add_user(n, False)
+    else:
+        contacts_listbox.insert(tk.END, "(none)")
+        contacts_index.append(None)
+        contacts_listbox.itemconfig(contacts_listbox.size()-1, foreground="#aaa")
+
     # restore selection
-    if selected_name and selected_name in contacts:
-        idx = contacts.index(selected_name)
-        contacts_listbox.selection_clear(0, tk.END)
-        contacts_listbox.selection_set(idx)
+    if prev_selected:
+        for i, uname in enumerate(contacts_index):
+            if uname == prev_selected:
+                contacts_listbox.selection_clear(0, tk.END)
+                contacts_listbox.selection_set(i)
+                contacts_listbox.see(i)
+                break
+    # restore scroll
+    contacts_listbox.yview_moveto(y[0])
+
+def refresh_contacts_list():
+    online_flags = []
+    for n in sorted(contacts, key=str.lower):
+        try:
+            online_flags.append((n, 1 if is_user_online(n) else 0))
+        except Exception:
+            online_flags.append((n, 0))
+    token = tuple(online_flags)
+    if token != _last_render_state["hash"]:
+        rebuild_contacts_list()
+        _last_render_state["hash"] = token
 
 def on_select_contact(_event):
     if not contacts_listbox.curselection():
         return
     idx = contacts_listbox.curselection()[0]
-    name = contacts[idx]
-    selected_contact["username"] = name
-    # render convo
+    uname = contacts_index[idx]
+    if uname is None:  # header/placeholder clicked
+        contacts_listbox.selection_clear(idx)
+        return
+
+    selected_contact["username"] = uname
+
     chat_box.config(state=tk.NORMAL)
     chat_box.delete(1.0, tk.END)
-    for line in conversations.get(name, []):
+    for line in conversations.get(uname, []):
         chat_box.insert(tk.END, line + "\n")
     chat_box.see(tk.END)
-    # show message bar
     msg_frame.pack(fill=tk.X, padx=0, pady=4)
+
+    # Load + move pending for this contact
+    def _bg_view_pending():
+        try:
+            cnt = view_pending_for_contact(
+                current_user=gui_user["username"],
+                contact=uname,
+                password=gui_user["password"],
+                on_message=on_message_received,
+                on_file=on_file_received
+            )
+            if cnt:
+                ui_call(append_chat_line, uname, f"(Loaded {cnt} pending messages)")
+        except Exception as e:
+            print("view_pending_for_contact error:", e)
+
+    if gui_user["username"]:
+        threading.Thread(target=_bg_view_pending, daemon=True).start()
 
 contacts_listbox.bind('<<ListboxSelect>>', on_select_contact)
 
@@ -309,8 +417,10 @@ msg_entry.bind("<Return>", on_enter_send)
 msg_frame.pack_forget()
 
 def scheduled_presence_refresh():
-    if gui_user["username"]:
-        refresh_contacts_list()
+    try:
+        refresh_contacts_list()    # refresh even if not logged in
+    except Exception as e:
+        print("presence refresh:", e)
     root.after(3000, scheduled_presence_refresh)
 
 scheduled_presence_refresh()
@@ -325,5 +435,15 @@ root.protocol("WM_DELETE_WINDOW", on_close)
 
 # start with disabled chat controls
 set_logged_out()
+
+try:
+    users = list_all_users()         
+    contacts.clear()
+    contacts.extend(users)
+    for u in users:
+        conversations.setdefault(u, [])
+    refresh_contacts_list()
+except Exception as e:
+    print("Initial user load failed:", e)
 
 root.mainloop()

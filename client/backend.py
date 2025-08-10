@@ -6,12 +6,14 @@ import socket
 import base64
 import threading
 import hashlib
-from datetime import datetime
+import time
+
 
 from Crypto.PublicKey import ECC
 from Crypto.Cipher import AES
 from Crypto.Hash import SHA256
 from Crypto.Protocol.KDF import HKDF
+from datetime import datetime, timedelta
 
 from encryption_utils import (
     generate_dh_keypair, export_key, encrypt_private_key, save_key_to_file,
@@ -26,7 +28,7 @@ from decrypt_messaging import decrypt_and_verify_message
 from mysql_wb import get_conn, ensure_tables, q
 
 KEY_DIR = './keys/'
-
+ONLINE_TTL = 40
 
 # ---------------------------- AUTH HELPERS ----------------------------
 def password_is_strong(password: str) -> bool:
@@ -260,15 +262,30 @@ def reset_all_presence() -> None:
     conn.close()
 
 
+
+
 def is_user_online(username: str) -> bool:
     ensure_tables()
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute(q("SELECT 1 FROM online_users WHERE username = ?"), (username,))
-        return c.fetchone() is not None
+        c.execute(q("SELECT updated_on FROM online_users WHERE username = ?"), (username,))
+        row = c.fetchone()
     finally:
         conn.close()
+
+    if not row or not row[0]:
+        return False
+
+    ts = row[0]
+    # MySQL returns datetime; if string, parse ISO
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts.replace("Z",""))
+        except Exception:
+            return False
+
+    return (datetime.utcnow() - ts) <= timedelta(seconds=ONLINE_TTL)
 
 
 def _persist_message_history(bundle: dict, recipient: str) -> None:
@@ -371,16 +388,9 @@ def send_text_message(sender: str, password: str, recipient: str, message: str) 
 
 
 def send_text_message_pfs(sender: str, password: str, recipient: str, message: str) -> None:
-    """
-    Perfect Forward Secrecy message send:
-    - fresh ephemeral X25519 keypair per message
-    - derive AES key via ECDH(ephemeral_priv, recipient_static_pub) and HKDF-SHA256
-    - sign (eph_pub_pem || nonce || tag || ciphertext) with Ed25519
-    - include eph_pub in bundle
-    """
     ensure_tables()
 
-    # recipient public + address
+    # 1) recipient pubkey (needed to encrypt even if offline)
     conn = get_conn()
     c = conn.cursor()
     c.execute(q("SELECT public_key FROM users WHERE username = ?"), (recipient,))
@@ -389,35 +399,25 @@ def send_text_message_pfs(sender: str, password: str, recipient: str, message: s
     if not pub_row:
         raise ValueError("Recipient not registered.")
 
-    ip_port = _resolve_online(recipient)
-    if not ip_port:
-        raise ValueError("Recipient is offline.")
-
-    recipient_ip, recipient_port = ip_port
-
     recipient_pub_pem = pub_row[0]
     if isinstance(recipient_pub_pem, memoryview):
         recipient_pub_pem = recipient_pub_pem.tobytes()
     recipient_pub_key = ECC.import_key(recipient_pub_pem)
 
-    # Ephemeral X25519
+    # 2) build the PFS bundle (ephemeral key, HKDF, encrypt, sign)
     eph_priv, eph_pub = generate_dh_keypair()
     eph_pub_pem = export_key(eph_pub).encode()
 
-    # ECDH(ephemeral_priv × recipient_static_pub)
     shared_point = recipient_pub_key.pointQ * eph_priv.d
     shared_secret = int(shared_point.x).to_bytes(32, "big")
 
-    # HKDF with context BOTH sides agree on
     info = f"PFS|{sender}|{recipient}".encode()
     aes_key = HKDF(master=shared_secret, key_len=32, salt=None, hashmod=SHA256, context=info)
 
-    # Encrypt
     cipher = AES.new(aes_key, AES.MODE_EAX)
     ciphertext, tag = cipher.encrypt_and_digest(message.encode())
     nonce = cipher.nonce
 
-    # Sign (eph_pub_pem || nonce || tag || ciphertext)
     signing_priv_pem = decrypt_private_key(
         load_key_from_file(os.path.join(KEY_DIR, f"{sender}_signing_private.enc")),
         password.encode()
@@ -435,6 +435,13 @@ def send_text_message_pfs(sender: str, password: str, recipient: str, message: s
         "sender": sender
     }
 
+    # 3) try live send; if offline, queue instead of raising
+    ip_port = _resolve_online(recipient)
+    if not ip_port:
+        _enqueue_message(recipient, sender, 'text', json.dumps(bundle).encode())
+        return
+
+    recipient_ip, recipient_port = ip_port
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(5)
         s.connect((recipient_ip, int(recipient_port)))
@@ -498,10 +505,10 @@ def start_receiver(username: str, password: str, on_message, on_file) -> int:
         start_receiver.server_socket = srv
 
         # On becoming online, drain queued messages
-        try:
-            _drain_pending(username, password, on_message, on_file)
-        except Exception:
-            pass
+        # try:
+        #     _drain_pending(username, password, on_message, on_file)
+        # except Exception:
+        #     pass
 
         while not start_receiver.stop_event.is_set():
             try:
@@ -588,3 +595,160 @@ def stop_receiver():
             srv.close()
         except Exception:
             pass
+
+def get_pending_for_pair(recipient: str, other_party: str):
+    """
+    Return list of (id, sender, msg_type, payload_json_bytes) for this chat.
+    Only rows addressed to `recipient` and from/to `other_party`.
+    """
+    ensure_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(q("""
+        SELECT id, sender, msg_type, payload
+        FROM pending_messages
+        WHERE recipient = ?
+          AND sender = ?
+          AND delivered = 0
+        ORDER BY id ASC
+    """), (recipient, other_party))
+    rows = c.fetchall() or []
+    conn.close()
+    return rows
+
+
+def move_pending_to_messages(ids: list[int]):
+    """
+    Move a set of pending rows into the messages table, then delete them.
+    We keep the original JSON payload and mark as was_offline=1.
+    """
+    if not ids:
+        return
+    ensure_tables()
+    conn = get_conn()
+    c = conn.cursor()
+
+    # Insert into messages (adjust column names to your schema)
+    # Example messages schema assumed:
+    # messages(msg_id PK, sender, recipient, ts, nonce_base64, tag_base64, ct_base64,
+    #          signature_base64, pfs, eph_pub_base64, is_offline)
+    #
+    # Since pending stores a JSON payload, we rehydrate fields here.
+    # We’ll do it row-by-row to stay DB-agnostic.
+    c2 = conn.cursor()
+    c3 = conn.cursor()
+    for pid in ids:
+        c2.execute(q("SELECT recipient, sender, msg_type, payload FROM pending_messages WHERE id = ?"), (pid,))
+        row = c2.fetchone()
+        if not row:
+            continue
+        recipient, sender, msg_type, payload = row
+        try:
+            bundle = json.loads(payload.decode())
+        except Exception:
+            bundle = {}
+
+        ts = int(bundle.get("ts") or time.time())
+        nonce_b64 = bundle.get("nonce", "")
+        tag_b64 = bundle.get("tag", "")
+        ct_b64 = bundle.get("ciphertext", "")
+        sig_b64 = bundle.get("signature", "")
+        pfs = 1 if bundle.get("pfs") else 0
+        eph_pub_b64 = bundle.get("eph_pub", "")
+
+        # Deterministic msg_id (same logic as _persist_message_history)
+        base = (bundle.get("sender","") + "|" + recipient + "|" + nonce_b64 + tag_b64 + ct_b64).encode()
+        msg_id = SHA256.new(base).hexdigest()
+
+        c3.execute(q("""
+    INSERT IGNORE INTO messages
+    (msg_id, sender, recipient, ts, nonce_base64, tag_base64, ct_base64, signature_base64)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+"""), (
+    msg_id,
+    sender,
+    recipient,
+    ts,
+    nonce_b64,
+    tag_b64,
+    ct_b64,
+    sig_b64
+))
+
+        # Finally delete the pending row
+        c3.execute(q("DELETE FROM pending_messages WHERE id = ?"), (pid,))
+
+    conn.commit()
+    conn.close()
+
+
+def view_pending_for_contact(current_user: str, contact: str, password: str, on_message, on_file):
+    """
+    1) Load all undelivered pending messages in this 1:1 chat.
+    2) Decrypt/verify and dispatch to callbacks (so the user 'views' them).
+    3) Move them into messages table and delete from pending.
+    """
+    rows = get_pending_for_pair(recipient=current_user, other_party=contact)
+    if not rows:
+        return 0
+
+    moved_ids = []
+    for pid, sender, msg_type, payload in rows:
+        try:
+            bundle = json.loads(payload.decode())
+
+            if msg_type == 'text':
+                msg = decrypt_and_verify_message(
+                    priv_key_path=os.path.join(KEY_DIR, f"{current_user}_private.enc"),
+                    password=password,
+                    sender_pub_key_path=os.path.join(KEY_DIR, f"{sender}_public.pem"),
+                    nonce_b64=bundle["nonce"],
+                    tag_b64=bundle["tag"],
+                    ciphertext_b64=bundle["ciphertext"],
+                    signature_b64=bundle["signature"],
+                    sender_username=sender,
+                    eph_pub_b64=bundle.get("eph_pub"),
+                    recipient_username=current_user,
+                )
+                on_message(sender, msg)
+
+            elif msg_type == 'file':
+                temp_path = f"temp_{bundle['filename']}"
+                with open(temp_path, "wb") as f:
+                    f.write(base64.b64decode(bundle["file_data"]))
+                output_path = "received_" + bundle['filename']
+                decrypt_and_verify_file(
+                    priv_key_path=os.path.join(KEY_DIR, f"{current_user}_private.enc"),
+                    password=password,
+                    sender_pub_key_path=os.path.join(KEY_DIR, f"{sender}_public.pem"),
+                    encrypted_image_path=temp_path,
+                    output_path=output_path,
+                    sender_username=sender
+                )
+                on_file(sender, output_path)
+
+            moved_ids.append(pid)
+
+        except Exception:
+            # If decryption fails, do not move/delete; leave for later troubleshooting.
+            import traceback; traceback.print_exc()
+
+    # Only after user has 'seen' them (callbacks fired), move → messages & delete
+    move_pending_to_messages(moved_ids)
+    return len(moved_ids)
+
+
+def list_all_users(exclude: str | None = None) -> list[str]:
+    """Return all usernames (optionally exclude the current user)."""
+    ensure_tables()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        if exclude:
+            c.execute(q("SELECT username FROM users WHERE username <> ? ORDER BY username"), (exclude,))
+        else:
+            c.execute(q("SELECT username FROM users ORDER BY username"))
+        return [row[0] for row in (c.fetchall() or [])]
+    finally:
+        conn.close()
+
