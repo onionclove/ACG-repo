@@ -7,7 +7,8 @@ from backend import (
     start_receiver, stop_receiver,
     send_text_message, send_text_message_pfs, send_encrypted_file,
     view_pending_for_contact,
-    list_all_users
+    list_all_users, 
+    get_chat_history
 )
 
 gui_user = {"username": None, "password": None, "port": None, "receiver_started": False}
@@ -295,6 +296,7 @@ def rebuild_contacts_list():
             prev_selected = contacts_index[prev_idx]
 
     contacts_listbox.delete(0, tk.END)
+    contacts_index = [] 
 
     online, offline = split_online_offline(contacts)
 
@@ -360,16 +362,46 @@ def on_select_contact(_event):
 
     selected_contact["username"] = uname
 
+    # open chat UI
     chat_box.config(state=tk.NORMAL)
     chat_box.delete(1.0, tk.END)
-    for line in conversations.get(uname, []):
-        chat_box.insert(tk.END, line + "\n")
-    chat_box.see(tk.END)
     msg_frame.pack(fill=tk.X, padx=0, pady=4)
 
-    # Load + move pending for this contact
-    def _bg_view_pending():
+    # if not logged in, show hint and disable send
+    if not gui_user["username"]:
+        send_btn.config(state=tk.DISABLED)
+        send_file_btn.config(state=tk.DISABLED)
+        chat_box.insert(tk.END, "(Login to view message history and send messages.)\n")
+        chat_box.see(tk.END)
+        return
+
+    # logged in: enable send
+    send_btn.config(state=tk.NORMAL)
+    send_file_btn.config(state=tk.NORMAL)
+
+    # load history + pending in background
+    def _bg_load():
         try:
+            # 1) history from DB
+            hist = get_chat_history(
+                current_user=gui_user["username"],
+                password=gui_user["password"],
+                contact=uname,
+                limit=500
+            )
+            def _render_hist():
+                conversations.setdefault(uname, [])
+                conversations[uname].clear()
+                for sender, text, _ts in hist:
+                    prefix = "You" if sender == gui_user["username"] else sender
+                    line = f"{prefix}: {text}"
+                    conversations[uname].append(line)
+                    if selected_contact["username"] == uname:
+                        chat_box.insert(tk.END, line + "\n")
+                chat_box.see(tk.END)
+            ui_call(_render_hist)
+
+            # 2) pending (callbacks will append; rows are then moved to messages)
             cnt = view_pending_for_contact(
                 current_user=gui_user["username"],
                 contact=uname,
@@ -380,10 +412,9 @@ def on_select_contact(_event):
             if cnt:
                 ui_call(append_chat_line, uname, f"(Loaded {cnt} pending messages)")
         except Exception as e:
-            print("view_pending_for_contact error:", e)
+            print("load history/pending error:", e)
 
-    if gui_user["username"]:
-        threading.Thread(target=_bg_view_pending, daemon=True).start()
+    threading.Thread(target=_bg_load, daemon=True).start()
 
 contacts_listbox.bind('<<ListboxSelect>>', on_select_contact)
 

@@ -752,3 +752,47 @@ def list_all_users(exclude: str | None = None) -> list[str]:
     finally:
         conn.close()
 
+
+def get_chat_history(current_user: str, password: str, contact: str, limit: int = 500):
+    """
+    Return [(sender, plaintext, ts), ...] oldest-first for current_user <-> contact.
+    Decrypts using current_user's private key and sender's public key.
+    """
+    ensure_tables()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(q("""
+            SELECT sender, recipient, ts, nonce_base64, tag_base64, ct_base64, signature_base64
+            FROM messages
+            WHERE (sender = ? AND recipient = ?)
+               OR (sender = ? AND recipient = ?)
+            ORDER BY ts ASC
+            LIMIT ?
+        """), (current_user, contact, contact, current_user, int(limit)))
+        rows = c.fetchall() or []
+    finally:
+        conn.close()
+
+    out = []
+    for sender, _recipient, ts, nonce_b64, tag_b64, ct_b64, sig_b64 in rows:
+        try:
+            msg = decrypt_and_verify_message(
+                priv_key_path=os.path.join(KEY_DIR, f"{current_user}_private.enc"),
+                password=password,
+                sender_pub_key_path=os.path.join(KEY_DIR, f"{sender}_public.pem"),
+                nonce_b64=nonce_b64,
+                tag_b64=tag_b64,
+                ciphertext_b64=ct_b64,
+                signature_b64=sig_b64,
+                sender_username=sender,
+                eph_pub_b64=None,
+                recipient_username=current_user
+            )
+            out.append((sender, msg, int(ts)))
+        except Exception:
+            # skip corrupt/legacy rows
+            continue
+    return out
+
+
