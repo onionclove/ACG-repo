@@ -1,4 +1,4 @@
-# client/print_thread.py
+# xukai
 import os, time, tempfile
 from mysql_wb import get_conn, q, ensure_tables
 from decrypt_messaging import decrypt_and_verify_message

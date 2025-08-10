@@ -1,4 +1,4 @@
-# client.py
+# Jingkai
 import os
 import base64
 import hashlib

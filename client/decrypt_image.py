@@ -1,4 +1,4 @@
-# decrypt_image.py (MySQL version)
+# decrypt_image.py  (Jingkai, Craig)
 import os
 import base64
 from Crypto.PublicKey import ECC

@@ -1,4 +1,4 @@
-# encryption_utils.py
+# Jingkai
 from Crypto.PublicKey import ECC
 from Crypto.Hash import SHA256
 from Crypto.Cipher import AES

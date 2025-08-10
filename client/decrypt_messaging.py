@@ -1,4 +1,4 @@
-# decrypt_messaging.py (supports PFS and legacy; fixed HKDF info)
+# Jerome, Jingkai (PFS)
 import base64
 from Crypto.PublicKey import ECC
 from Crypto.Cipher import AES

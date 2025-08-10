@@ -1,3 +1,5 @@
-Jingkai: Infrastructure of project, client.py, frontend skeleton, PFS implementation, backend.py, encryption_utils.py, mysql_wb.py, init_tables.py and edited, refined and refactored all parts
+Jingkai: Infrastructure of project, client.py, frontend skeleton, PFS implementation, backend.py, encryption_utils.py, mysql_wb.py, implemented sockets for backend, init_tables.py and edited, refined and refactored all parts.
 Craig: I made file encryption and decryption and worked on front end of the messaging app
 Xukai: User login and message encryption, implemented chat history feature and fixed as well debugs code problems 
+Jerome: I made message decryption and worked on front end of the messaging app
+Jotish: Digital Signatures, implemented auto resolving of ports and IP, implemented online users and frontend for online/offline users, fixed and debugged certain areas of the code.

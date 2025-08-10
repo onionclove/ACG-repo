@@ -1,4 +1,4 @@
-# backend.py
+# Jingkai, xukai, jotish
 import os
 import json
 import time
@@ -689,9 +689,9 @@ def move_pending_to_messages(ids: list[int]):
 
 def view_pending_for_contact(current_user: str, contact: str, password: str, on_message, on_file):
     """
-    1) Load all undelivered pending messages in this 1:1 chat.
-    2) Decrypt/verify and dispatch to callbacks (so the user 'views' them).
-    3) Move them into messages table and delete from pending.
+    Load all undelivered pending messages in this 1:1 chat.
+    Decrypt/verify and dispatch to callbacks (so the user 'views' them).
+    Move them into messages table and delete from pending.
     """
     rows = get_pending_for_pair(recipient=current_user, other_party=contact)
     if not rows:

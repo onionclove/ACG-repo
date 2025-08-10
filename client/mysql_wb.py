@@ -1,5 +1,4 @@
-# mysql_wb.py
-# Clean MySQL adapter for your chat app
+# Jingkai
 
 import os
 from dotenv import load_dotenv
