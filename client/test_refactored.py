@@ -2,6 +2,8 @@ from client import register_user, login_user, send_encrypted_message
 from encrypt_image import encrypt_and_sign_image
 from decrypt_image import decrypt_and_verify_image
 from decrypt_messaging import decrypt_and_verify_message
+from history import load_thread
+import time
 import os
 
 # Test user config
@@ -81,3 +83,13 @@ else:
         print("Image decryption success:", success)
     except Exception as e:
         print("❌ Image decryption failed:", e)
+
+if __name__ == "__main__":
+    me   = input("My username: ").strip()
+    pw   = input("My password: ").strip()
+    peer = input("Peer username: ").strip()
+
+    msgs = load_thread(me, pw, peer)
+    print(f"\n=== Chat {me} ↔ {peer} ===")
+    for ts, sender, body in msgs:
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(ts)))}  {sender}: {body}")
