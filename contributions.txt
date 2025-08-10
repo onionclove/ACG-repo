@@ -1,0 +1,3 @@
+Jingkai: Infrastructure of project, client.py, frontend skeleton, PFS implementation, backend.py, encryption_utils.py, mysql_wb.py, init_tables.py and edited, refined and refactored all parts
+Craig: I made file encryption and decryption and worked on front end of the messaging app
+Xukai: 
