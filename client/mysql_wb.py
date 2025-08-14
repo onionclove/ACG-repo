@@ -2,7 +2,7 @@
 
 import os
 from dotenv import load_dotenv
-import mysql.connector
+import pymysql
 
 # Load .env from current directory first, then project root
 ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '.env'))
@@ -23,16 +23,16 @@ CONNECT_KW = dict(
     user=DB_USER,
     password=DB_PASSWORD,
     port=DB_PORT,
-    connection_timeout=5,
-    use_pure=True,
-    raise_on_warnings=False,
+    connect_timeout=10,
+    autocommit=True,
+    charset='utf8mb4',
 )
 
 def _connect_no_db():
-    return mysql.connector.connect(**CONNECT_KW)
+    return pymysql.connect(**CONNECT_KW)
 
 def _connect_with_db():
-    return mysql.connector.connect(database=DB_NAME, **CONNECT_KW)
+    return pymysql.connect(database=DB_NAME, **CONNECT_KW)
 
 def ensure_database():
     conn = _connect_no_db()
@@ -52,7 +52,7 @@ def _exec(cursor, sql):
     """Small helper so if something breaks, you see exactly what."""
     try:
         cursor.execute(sql)
-    except mysql.connector.Error as e:
+    except pymysql.Error as e:
         raise RuntimeError(f"MySQL error {e.errno} on SQL:\n{sql}\n{e.msg}") from e
 
 def ensure_tables():
