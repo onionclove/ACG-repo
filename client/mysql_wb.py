@@ -4,9 +4,13 @@ import os
 from dotenv import load_dotenv
 import mysql.connector
 
-# Load .env from project root (one level up from /client)
-ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
+# Load .env from current directory first, then project root
+ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '.env'))
 load_dotenv(ENV_PATH)
+
+# Also try loading from project root (one level up from /client)
+ENV_PATH_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
+load_dotenv(ENV_PATH_ROOT)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_USER = os.getenv("DB_USER")

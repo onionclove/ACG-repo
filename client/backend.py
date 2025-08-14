@@ -30,6 +30,54 @@ from mysql_wb import get_conn, ensure_tables, q
 KEY_DIR = './keys/'
 ONLINE_TTL = 40
 
+# Relay configuration
+USE_RELAY = os.getenv("USE_RELAY", "false").lower() == "true"
+RELAY_HOST = os.getenv("RELAY_HOST", "127.0.0.1")
+RELAY_PORT = int(os.getenv("RELAY_PORT", "7000"))
+
+class RelayClient:
+    """
+    Keeps one TCP connection to the relay open. Thread-safe send.
+    """
+    def __init__(self, username, on_bundle):
+        self.username = username
+        self.on_bundle = on_bundle
+        self.sock = None
+        self.lock = threading.Lock()
+        self.reader = None
+
+    def connect(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((RELAY_HOST, RELAY_PORT))
+        s.sendall(json.dumps({"hello": self.username}).encode())
+        self.sock = s
+        self.reader = threading.Thread(target=self._read_loop, daemon=True)
+        self.reader.start()
+
+    def _read_loop(self):
+        while True:
+            try:
+                data = self.sock.recv(1<<16)
+                if not data:
+                    break
+                # data is the original bundle dict (sender included inside)
+                bundle = json.loads(data.decode())
+                self.on_bundle(bundle)
+            except Exception:
+                break
+
+    def send_to(self, recipient, bundle_dict):
+        payload = {"to": recipient, "payload": bundle_dict}
+        b = json.dumps(payload).encode()
+        with self.lock:
+            self.sock.sendall(b)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
 # ---------------------------- AUTH HELPERS ----------------------------
 def password_is_strong(password: str) -> bool:
     return (
@@ -377,17 +425,21 @@ def send_text_message(sender: str, password: str, recipient: str, message: str) 
     # Keep a local plaintext copy so history shows your side
     _store_sent_copy(sender, recipient, message, int(time.time()))
 
-    # Queue if offline
-    if not ip_port:
-        _enqueue_message(recipient, sender, 'text', json.dumps(bundle).encode())
-        return
+    if USE_RELAY:
+        # Assume start_receiver() was called; relay is connected.
+        start_receiver.relay.send_to(recipient, bundle)
+    else:
+        # Queue if offline
+        if not ip_port:
+            _enqueue_message(recipient, sender, 'text', json.dumps(bundle).encode())
+            return
 
-    # Send now
-    recipient_ip, recipient_port = ip_port
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(5)
-        s.connect((recipient_ip, int(recipient_port)))
-        s.sendall(json.dumps(bundle).encode())
+        # Send now
+        recipient_ip, recipient_port = ip_port
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect((recipient_ip, int(recipient_port)))
+            s.sendall(json.dumps(bundle).encode())
 
 
 def send_text_message_pfs(sender: str, password: str, recipient: str, message: str) -> None:
@@ -440,17 +492,21 @@ def send_text_message_pfs(sender: str, password: str, recipient: str, message: s
 
     _store_sent_copy(sender, recipient, message, int(time.time()))
 
-    # 3) try live send; if offline, queue instead of raising
-    ip_port = _resolve_online(recipient)
-    if not ip_port:
-        _enqueue_message(recipient, sender, 'text', json.dumps(bundle).encode())
-        return
+    if USE_RELAY:
+        # Assume start_receiver() was called; relay is connected.
+        start_receiver.relay.send_to(recipient, bundle)
+    else:
+        # 3) try live send; if offline, queue instead of raising
+        ip_port = _resolve_online(recipient)
+        if not ip_port:
+            _enqueue_message(recipient, sender, 'text', json.dumps(bundle).encode())
+            return
 
-    recipient_ip, recipient_port = ip_port
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(5)
-        s.connect((recipient_ip, int(recipient_port)))
-        s.sendall(json.dumps(bundle).encode())
+        recipient_ip, recipient_port = ip_port
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect((recipient_ip, int(recipient_port)))
+            s.sendall(json.dumps(bundle).encode())
 
 
 def send_encrypted_file(sender: str, password: str, recipient: str, file_path: str) -> None:
@@ -469,7 +525,6 @@ def send_encrypted_file(sender: str, password: str, recipient: str, file_path: s
     with open(output_path, "rb") as f:
         encrypted_data = base64.b64encode(f.read()).decode()
 
-    ip_port = _resolve_online(recipient)
     bundle = {
         "type": "file",
         "file_data": encrypted_data,
@@ -477,15 +532,20 @@ def send_encrypted_file(sender: str, password: str, recipient: str, file_path: s
         "sender": sender
     }
 
-    if not ip_port:
-        _enqueue_message(recipient, sender, 'file', json.dumps(bundle).encode())
-        return
+    if USE_RELAY:
+        # Assume start_receiver() was called; relay is connected.
+        start_receiver.relay.send_to(recipient, bundle)
+    else:
+        ip_port = _resolve_online(recipient)
+        if not ip_port:
+            _enqueue_message(recipient, sender, 'file', json.dumps(bundle).encode())
+            return
 
-    recipient_ip, recipient_port = ip_port
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(5)
-        s.connect((recipient_ip, int(recipient_port)))
-        s.sendall(json.dumps(bundle).encode())
+        recipient_ip, recipient_port = ip_port
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect((recipient_ip, int(recipient_port)))
+            s.sendall(json.dumps(bundle).encode())
 
 
 def start_receiver(username: str, password: str, on_message, on_file) -> int:
@@ -495,102 +555,152 @@ def start_receiver(username: str, password: str, on_message, on_file) -> int:
     """
     _verify_login(username, password)
 
-    def run_server():
-        ip = "0.0.0.0"
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((ip, 0))  # ephemeral port
-        srv.listen()
-        bound_port = srv.getsockname()[1]
-
-        adv_ip = _best_local_ip()
-        _set_online(username, adv_ip, bound_port)
-
-        start_receiver.bound_port = bound_port
-        start_receiver.server_socket = srv
-
-        # On becoming online, drain queued messages
-        # try:
-        #     _drain_pending(username, password, on_message, on_file)
-        # except Exception:
-        #     pass
-
-        while not start_receiver.stop_event.is_set():
-            try:
-                conn, _addr = srv.accept()
-            except OSError:
-                break
-            threading.Thread(
-                target=_handle_conn,
-                args=(conn, username, password, on_message, on_file),
-                daemon=True
-            ).start()
-
+    def handle_incoming_bundle(bundle):
+        # This is what your old accept-loop did with JSON bundle.
         try:
-            srv.close()
+            if bundle.get("type") == "text":
+                msg = decrypt_and_verify_message(
+                    priv_key_path=os.path.join(KEY_DIR, f"{username}_private.enc"),
+                    password=password,
+                    sender_pub_key_path=os.path.join(KEY_DIR, f"{bundle['sender']}_public.pem"),
+                    nonce_b64=bundle["nonce"],
+                    tag_b64=bundle["tag"],
+                    ciphertext_b64=bundle["ciphertext"],
+                    signature_b64=bundle["signature"],
+                    sender_username=bundle['sender'],
+                    eph_pub_b64=bundle.get("eph_pub"),
+                    recipient_username=username
+                )
+                on_message(bundle['sender'], msg)
+                _persist_message_history(bundle, username)
+            elif bundle.get("type") == "file":
+                temp_path = f"temp_{bundle['filename']}"
+                with open(temp_path, "wb") as f:
+                    f.write(base64.b64decode(bundle["file_data"]))
+                output_path = "received_" + bundle['filename']
+                decrypt_and_verify_file(
+                    priv_key_path=os.path.join(KEY_DIR, f"{username}_private.enc"),
+                    password=password,
+                    sender_pub_key_path=os.path.join(KEY_DIR, f"{bundle['sender']}_public.pem"),
+                    encrypted_image_path=temp_path,
+                    output_path=output_path,
+                    sender_username=bundle['sender']
+                )
+                on_file(bundle['sender'], output_path)
         except Exception:
-            pass
+            import traceback; traceback.print_exc()
 
-    def _handle_conn(conn, my_username, my_password, cb_msg, cb_file):
-        with conn:
+    if USE_RELAY:
+        # Relay mode: no local TCP listener; single outbound connection.
+        start_receiver.bound_port = RELAY_PORT  # cosmetic for status
+        start_receiver.stop_event = threading.Event()
+        start_receiver.relay = RelayClient(username, handle_incoming_bundle)
+        start_receiver.relay.connect()
+        return start_receiver.bound_port
+    else:
+        # keep your existing direct-socket listener here (LAN mode)
+        def run_server():
+            ip = "0.0.0.0"
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((ip, 0))  # ephemeral port
+            srv.listen()
+            bound_port = srv.getsockname()[1]
+
+            adv_ip = _best_local_ip()
+            _set_online(username, adv_ip, bound_port)
+
+            start_receiver.bound_port = bound_port
+            start_receiver.server_socket = srv
+
+            # On becoming online, drain queued messages
+            # try:
+            #     _drain_pending(username, password, on_message, on_file)
+            # except Exception:
+            #     pass
+
+            while not start_receiver.stop_event.is_set():
+                try:
+                    conn, _addr = srv.accept()
+                except OSError:
+                    break
+                threading.Thread(
+                    target=_handle_conn,
+                    args=(conn, username, password, on_message, on_file),
+                    daemon=True
+                ).start()
+
             try:
-                data = b""
-                while True:
-                    chunk = conn.recv(8192)
-                    if not chunk:
-                        break
-                    data += chunk
-                if not data:
-                    return
-                bundle = json.loads(data.decode())
-
-                if bundle.get("type") == "text":
-                    msg = decrypt_and_verify_message(
-                        priv_key_path=os.path.join(KEY_DIR, f"{my_username}_private.enc"),
-                        password=my_password,
-                        sender_pub_key_path=os.path.join(KEY_DIR, f"{bundle['sender']}_public.pem"),
-                        nonce_b64=bundle["nonce"],
-                        tag_b64=bundle["tag"],
-                        ciphertext_b64=bundle["ciphertext"],
-                        signature_b64=bundle["signature"],
-                        sender_username=bundle['sender'],
-                        eph_pub_b64=bundle.get("eph_pub"),      # PFS if present
-                        recipient_username=my_username          # HKDF info match
-                    )
-                    cb_msg(bundle['sender'], msg)
-                    _persist_message_history(bundle, my_username)
-
-                elif bundle.get("type") == "file":
-                    temp_path = f"temp_{bundle['filename']}"
-                    with open(temp_path, "wb") as f:
-                        f.write(base64.b64decode(bundle["file_data"]))
-                    output_path = "received_" + bundle['filename']
-                    decrypt_and_verify_file(
-                        priv_key_path=os.path.join(KEY_DIR, f"{my_username}_private.enc"),
-                        password=my_password,
-                        sender_pub_key_path=os.path.join(KEY_DIR, f"{bundle['sender']}_public.pem"),
-                        encrypted_image_path=temp_path,
-                        output_path=output_path,
-                        sender_username=bundle['sender']
-                    )
-                    cb_file(bundle['sender'], output_path)
-
+                srv.close()
             except Exception:
-                import traceback
-                print("[Receiver] Error handling inbound packet:")
-                traceback.print_exc()
+                pass
 
-    start_receiver.stop_event = threading.Event()
-    t = threading.Thread(target=run_server, daemon=True)
-    t.start()
+        def _handle_conn(conn, my_username, my_password, cb_msg, cb_file):
+            with conn:
+                try:
+                    data = b""
+                    while True:
+                        chunk = conn.recv(8192)
+                        if not chunk:
+                            break
+                        data += chunk
+                    if not data:
+                        return
+                    bundle = json.loads(data.decode())
 
-    while getattr(start_receiver, "bound_port", None) is None:
-        pass
+                    if bundle.get("type") == "text":
+                        msg = decrypt_and_verify_message(
+                            priv_key_path=os.path.join(KEY_DIR, f"{my_username}_private.enc"),
+                            password=my_password,
+                            sender_pub_key_path=os.path.join(KEY_DIR, f"{bundle['sender']}_public.pem"),
+                            nonce_b64=bundle["nonce"],
+                            tag_b64=bundle["tag"],
+                            ciphertext_b64=bundle["ciphertext"],
+                            signature_b64=bundle["signature"],
+                            sender_username=bundle['sender'],
+                            eph_pub_b64=bundle.get("eph_pub"),      # PFS if present
+                            recipient_username=my_username          # HKDF info match
+                        )
+                        cb_msg(bundle['sender'], msg)
+                        _persist_message_history(bundle, my_username)
+
+                    elif bundle.get("type") == "file":
+                        temp_path = f"temp_{bundle['filename']}"
+                        with open(temp_path, "wb") as f:
+                            f.write(base64.b64decode(bundle["file_data"]))
+                        output_path = "received_" + bundle['filename']
+                        decrypt_and_verify_file(
+                            priv_key_path=os.path.join(KEY_DIR, f"{my_username}_private.enc"),
+                            password=my_password,
+                            sender_pub_key_path=os.path.join(KEY_DIR, f"{bundle['sender']}_public.pem"),
+                            encrypted_image_path=temp_path,
+                            output_path=output_path,
+                            sender_username=bundle['sender']
+                        )
+                        cb_file(bundle['sender'], output_path)
+
+                except Exception:
+                    import traceback
+                    print("[Receiver] Error handling inbound packet:")
+                    traceback.print_exc()
+
+        start_receiver.stop_event = threading.Event()
+        t = threading.Thread(target=run_server, daemon=True)
+        t.start()
+
+        while getattr(start_receiver, "bound_port", None) is None:
+            pass
 
     return start_receiver.bound_port
 
 
 def stop_receiver():
+    if USE_RELAY:
+        rc = getattr(start_receiver, "relay", None)
+        if rc:
+            rc.close()
+        return
+    # else your old socket close
     ev = getattr(start_receiver, "stop_event", None)
     if ev:
         ev.set()
